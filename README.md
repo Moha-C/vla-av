@@ -73,6 +73,12 @@ Tested local setup:
 - Miniconda
 - Python 3.8.18 in the `simlingo` env
 
+For a new machine, follow:
+
+```text
+docs/FRESH_INSTALL.md
+```
+
 Install system dependencies:
 
 ```bash
