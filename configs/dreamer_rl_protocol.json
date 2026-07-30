@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "objective": "Train experimental no-guard Dreamer PPO and Dreamer SDBS variants without overwriting the guarded SimLingo+Dreamer runtime checkpoints.",
+  "runtime_contract": {
+    "primary_driver": "SimLingo",
+    "dreamer_role": "intervention/residual scorer around SimLingo actions",
+    "stable_modes": [
+      "dreamer_ppo",
+      "dreamer_sdbs"
+    ],
+    "experimental_rl_modes": [
+      "dreamer_ppo_rl_noguard",
+      "dreamer_sdbs_rl_noguard"
+    ],
+    "production_rule": "Never install an RL checkpoint as latest runtime unless it passes the dataset audit, closed-loop smoke tests, and KPI comparison against the guarded checkpoint."
+  },
+  "collection": {
+    "preferred_teacher": "dreamer_ppo",
+    "secondary_teacher": "dreamer_sdbs",
+    "preferred_towns": [
+      "Town10HD",
+      "Town12",
+      "Town13"
+    ],
+    "scenario_buckets": [
+      "accident_overtake",
+      "blocked_lane",
+      "dense_traffic",
+      "vru_crossing",
+      "traffic_light",
+      "junction"
+    ],
+    "collection_mode": "CARLA POV + Action Dreaming collect",
+    "success_requirements_for_positive_teacher_runs": {
+      "collisions": 0,
+      "offroad_percent_max": 0.5,
+      "red_light_violations": 0,
+      "blocked_agent": false
+    }
+  },
+  "dataset_filtering": {
+    "state_dim": 28,
+    "action_dim": 4,
+    "action_key": "chosen_action",
+    "max_stationary_per_run": 60,
+    "stationary_progress_eps": 0.02,
+    "recovery_oversample": 3,
+    "near_hazard_oversample": 2,
+    "max_recovery_risk": 0.88,
+    "max_recovery_risk_increase": 0.03,
+    "min_recovery_ttc": 3.2,
+    "max_recovery_progress_drop": 0.01
+  },
+  "audit_thresholds": {
+    "min_transitions": 1000,
+    "min_runs": 2,
+    "min_routes": 2,
+    "max_stationary_fraction": 0.65,
+    "min_moving_fraction": 0.25,
+    "min_recovery_fraction": 0.02,
+    "max_throttle_brake_conflict_fraction": 0.05,
+    "min_steer_std": 0.015
+  },
+  "training_stages": [
+    {
+      "name": "offline_world_model_warmstart",
+      "description": "Train only the world model on audited SimLingo/Dreamer traces. This gives the scorer a realistic prior before closed-loop RL."
+    },
+    {
+      "name": "closed_loop_smoke",
+      "episodes": 10,
+      "description": "Small real CARLA run to verify device placement, logging, checkpoint writing, and no immediate policy collapse."
+    },
+    {
+      "name": "closed_loop_rl",
+      "episodes_min": 100,
+      "episodes_target": 300,
+      "description": "Longer PPO/SDBS training. Checkpoint is experimental until benchmarked in the dashboard."
+    },
+    {
+      "name": "dashboard_kpi_validation",
+      "description": "Compare native SimLingo, guarded Dreamer PPO, guarded SDBS, and the two RL no-guard variants on the same route/scenario families."
+    }
+  ]
+}

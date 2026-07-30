@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KIND="${DREAMER_RL_KIND:-ppo}"            # ppo | sdbs
 RUN_ID="${DREAMER_RL_RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 CONDA_ENV="${DREAMER_RL_CONDA_ENV:-simlingo}"
-DEVICE="${DREAMER_RL_DEVICE:-cuda}"
+DEVICE_REQUEST="${DREAMER_RL_DEVICE:-auto}"
 EPISODES="${DREAMER_RL_EPISODES:-100}"
 TOWN="${DREAMER_RL_TOWN:-Town10HD}"
 CARLA_HOST="${CARLA_HOST:-localhost}"
@@ -46,7 +46,7 @@ if [[ "$MOCK" == "1" ]]; then
   TRAIN_ARGS+=(--mock)
 fi
 
-INIT_WM="$CKPT_ROOT/init_guarded_world_model.pt"
+INIT_WM="${DREAMER_RL_INIT_WORLD_MODEL:-$CKPT_ROOT/init_guarded_world_model.pt}"
 RUN_DIR="$ROOT_DIR/logs/dreamer_rl_noguard/$KIND/$RUN_ID"
 LOG_DIR="$RUN_DIR/logs"
 RUN_CKPT_DIR="$CKPT_ROOT/runs/$RUN_ID"
@@ -121,6 +121,23 @@ else
   exit 1
 fi
 
+if [[ "$DEVICE_REQUEST" == "auto" ]]; then
+  DEVICE="$(conda run -n "$CONDA_ENV" python -c 'import torch; print("cuda" if torch.cuda.is_available() else "cpu")')"
+else
+  DEVICE="$DEVICE_REQUEST"
+  if [[ "$DEVICE" == cuda* ]]; then
+    CUDA_AVAILABLE="$(conda run -n "$CONDA_ENV" python -c 'import torch; print(1 if torch.cuda.is_available() else 0)')"
+    if [[ "$CUDA_AVAILABLE" != "1" ]]; then
+      if [[ "${DREAMER_RL_STRICT_DEVICE:-0}" == "1" ]]; then
+        echo "[dreamer-rl-start] requested $DEVICE but CUDA is unavailable" >&2
+        exit 1
+      fi
+      echo "[dreamer-rl-start] requested $DEVICE but CUDA is unavailable; falling back to cpu"
+      DEVICE="cpu"
+    fi
+  fi
+fi
+
 {
   echo "kind=$KIND"
   echo "run_id=$RUN_ID"
@@ -128,6 +145,8 @@ fi
   echo "run_dir=$RUN_DIR"
   echo "checkpoint_dir=$RUN_CKPT_DIR"
   echo "init_world_model=$INIT_WM"
+  echo "dataset=${DREAMER_RL_DATASET:-}"
+  echo "dataset_audit=${DREAMER_RL_DATASET_AUDIT:-}"
   echo "town=$TOWN"
   echo "episodes=$EPISODES"
   echo "max_episode_steps=$MAX_EPISODE_STEPS"
