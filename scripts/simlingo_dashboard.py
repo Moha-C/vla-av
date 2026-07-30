@@ -227,7 +227,7 @@ def start_run(payload):
         "SIMLINGO_TRAFFIC_LIGHT_OVERLAY": str(payload.get("traffic_light_overlay", "1")),
         "SIMLINGO_TRAFFIC_LIGHT_OVERLAY_DISTANCE": str(payload.get("traffic_light_overlay_distance", "160")),
         "SIMLINGO_TRAFFIC_LIGHT_OVERLAY_MAX": str(payload.get("traffic_light_overlay_max", "80")),
-        "SIMLINGO_PLAYBACK_AFTER": "1",
+        "SIMLINGO_PLAYBACK_AFTER": str(payload.get("playback_after", "1")),
         "SIMLINGO_PLAYBACK_SPEED": str(playback_speed),
         "SIMLINGO_OUT_DIR": str(ROOT / "logs" / "simlingo_eval"),
         "SIMLINGO_DREAMER_STATUS_PATH": str(ROOT / "logs" / "simlingo_eval" / "dreamer_guard_status.json"),
@@ -460,6 +460,12 @@ def start_run(payload):
             "ACTION_DREAMING_K": str(payload.get("action_dreaming_k", "5")),
             "ACTION_DREAMING_GENERATE_AFTER": "1",
         })
+        if payload.get("action_dreaming_out_dir"):
+            env["ACTION_DREAMING_OUT_DIR"] = str(payload["action_dreaming_out_dir"])
+        if payload.get("action_dreaming_run_id"):
+            env["ACTION_DREAMING_RUN_ID"] = str(payload["action_dreaming_run_id"])
+        if payload.get("action_dreaming_trace_path"):
+            env["ACTION_DREAMING_TRACE_PATH"] = str(payload["action_dreaming_trace_path"])
     if prompt_mode == "obstacle":
         env.update({
             "SIMLINGO_USER_FLAG": "1",
