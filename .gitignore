@@ -13,6 +13,23 @@ __pycache__/
 venv/
 env/
 
+# Local secrets and credentials. Never commit personal access tokens.
+.env
+.env.*
+*.token
+*token*
+*secret*
+*credential*
+credentials.*
+secrets.*
+*.pem
+*.key
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+wandb/
+
 # CARLA/SUMO generated runtime outputs
 logs/
 generated_routes/

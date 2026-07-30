@@ -21,9 +21,25 @@ The repository intentionally does not contain:
 - CARLA binaries.
 - Large SimLingo Hugging Face model weights.
 - Large pretrained VLM caches.
-- Generated logs, videos, datasets, exports, VM backups, and failed experiments.
+- Your local logs, videos, datasets, exports, VM backups, and failed experiments.
+- Personal tokens, keys, credentials, or local cache files.
 
-Those files are installed or regenerated locally.
+Those files are not recoverable from this repository and nobody gets access to
+your machine. A new user can only install public/upstream dependencies, download
+public model weights, or regenerate their own local artifacts.
+
+## Privacy And Secrets
+
+Do not commit personal Hugging Face, GitHub, OpenAI, WandB, SSH, or university
+tokens. If a model download ever requires authentication, the new user must log
+in with their own account/token:
+
+```bash
+hf auth login
+```
+
+The project should never require Mohammed's local tokens or private datasets to
+run the public/reproducible pipeline.
 
 ## 1. Clone
 

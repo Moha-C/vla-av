@@ -35,8 +35,10 @@ experiments/TwinSentinel_Project/ TwinSentinel attack console integration
 docs/                             Project handoffs and validation notes
 ```
 
-Large generated artifacts are intentionally ignored by Git: logs, videos, datasets,
-VM backups, downloaded models, pretrained VLMs, and CARLA itself.
+Large/private local artifacts are intentionally ignored by Git: logs, videos,
+datasets, VM backups, downloaded models, pretrained VLM caches, credentials, and
+CARLA itself. A fresh clone does not give anyone access to Mohammed's PC, tokens,
+private data, local videos, or backups.
 
 ## Runtime Modes
 
@@ -138,6 +140,9 @@ bash scripts/download_simlingo_model.sh
 ```
 
 The large Hugging Face model directory is ignored by Git.
+
+If Hugging Face authentication is ever needed, each user must use their own
+account/token. Do not commit tokens into this repository.
 
 ## Run The Dashboard
 
