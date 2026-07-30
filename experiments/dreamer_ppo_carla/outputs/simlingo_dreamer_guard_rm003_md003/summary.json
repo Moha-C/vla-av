@@ -1,0 +1,131 @@
+{
+  "checkpoint": "outputs/simlingo_world_model_20260616/best_world_model.pt",
+  "chosen_candidate_index_counts": {
+    "0": 2391,
+    "1": 38,
+    "2": 30,
+    "3": 32,
+    "4": 17,
+    "5": 15,
+    "6": 5
+  },
+  "jsonl": "/home/mohm/Desktop/vla-av-simlingo-dev/data/action_dreaming_adv/filtered/batch_town12_13_20260616_filtered.jsonl",
+  "metrics": {
+    "dreamer_progress_delta_vs_simlingo": {
+      "max": 0.010692764073610306,
+      "mean": 5.67331699130591e-05,
+      "median": 0.0,
+      "min": -0.014115559868514538
+    },
+    "dreamer_risk_delta_vs_simlingo": {
+      "max": 0.0,
+      "mean": -0.004004566464573145,
+      "median": 0.0,
+      "min": -0.3125283122062683
+    },
+    "meta_progress_delta_vs_simlingo": {
+      "max": 0.2243296504020691,
+      "mean": 0.0005567222251556814,
+      "median": 0.0,
+      "min": -0.13650000095367432
+    },
+    "meta_risk_delta_vs_simlingo": {
+      "max": 0.14062081277370453,
+      "mean": 0.0006287181749939919,
+      "median": 0.0,
+      "min": -0.0741426944732666
+    },
+    "meta_score_delta_vs_simlingo": {
+      "max": 0.0,
+      "mean": -0.001010446110740304,
+      "median": 0.0,
+      "min": -0.029977554455399513
+    }
+  },
+  "override_rate": 0.05419303797468354,
+  "overrides": 137,
+  "policy": {
+    "max_meta_drop": 0.03,
+    "risk_margin": 0.03,
+    "w_progress": 1.0,
+    "w_risk": 2.0
+  },
+  "samples": 2528,
+  "scenario_summary": {
+    "Accident": {
+      "override_rate": 0.08076923076923077,
+      "overrides": 21,
+      "samples": 260
+    },
+    "AccidentTwoWays": {
+      "override_rate": 0.06923076923076923,
+      "overrides": 9,
+      "samples": 130
+    },
+    "CrossingBicycleFlow": {
+      "override_rate": 0.0125,
+      "overrides": 2,
+      "samples": 160
+    },
+    "DynamicObjectCrossing": {
+      "override_rate": 0.01875,
+      "overrides": 3,
+      "samples": 160
+    },
+    "HardBreakRoute": {
+      "override_rate": 0.10126582278481013,
+      "overrides": 8,
+      "samples": 79
+    },
+    "HighwayCutIn": {
+      "override_rate": 0.053125,
+      "overrides": 17,
+      "samples": 320
+    },
+    "HighwayExit": {
+      "override_rate": 0.03125,
+      "overrides": 5,
+      "samples": 160
+    },
+    "MergerIntoSlowTraffic": {
+      "override_rate": 0.05625,
+      "overrides": 9,
+      "samples": 160
+    },
+    "MergerIntoSlowTrafficV2": {
+      "override_rate": 0.05362776025236593,
+      "overrides": 17,
+      "samples": 317
+    },
+    "ParkingCrossingPedestrian": {
+      "override_rate": 0.04375,
+      "overrides": 7,
+      "samples": 160
+    },
+    "PedestrianCrossing": {
+      "override_rate": 0.0,
+      "overrides": 0,
+      "samples": 144
+    },
+    "SequentialLaneChange": {
+      "override_rate": 0.15625,
+      "overrides": 25,
+      "samples": 160
+    },
+    "VanillaNonSignalizedTurn": {
+      "override_rate": 0.075,
+      "overrides": 12,
+      "samples": 160
+    },
+    "VanillaSignalizedTurnEncounterRedLight": {
+      "override_rate": 0.0,
+      "overrides": 0,
+      "samples": 61
+    },
+    "VehicleTurningRoutePedestrian": {
+      "override_rate": 0.020618556701030927,
+      "overrides": 2,
+      "samples": 97
+    }
+  }
+}

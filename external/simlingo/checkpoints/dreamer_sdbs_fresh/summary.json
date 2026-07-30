@@ -1,0 +1,12 @@
+{
+  "best": {
+    "epoch": 136,
+    "train_loss": 0.08368373468616291,
+    "loss": 0.019262571632862092,
+    "state_mae_norm": 0.027100102603435518,
+    "risk_mae": 0.01616638470441103,
+    "progress_mae_norm": 0.03205183185636997
+  },
+  "transitions": 2891,
+  "data": "experiments/dreamer_ppo_carla_sdbs_fresh/data/sdbs_teacher_20260716_103316.npz"
+}

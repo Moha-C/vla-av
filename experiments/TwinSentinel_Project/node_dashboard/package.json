@@ -1,0 +1,16 @@
+{
+  "name": "vanet-realtime-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Realtime VANET simulation dashboard (baseline vs attacked)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "express": "^4.21.1",
+    "socket.io": "^4.8.0"
+  }
+}

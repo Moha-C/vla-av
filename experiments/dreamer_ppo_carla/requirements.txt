@@ -1,0 +1,6 @@
+numpy>=1.21
+torch>=1.12
+matplotlib>=3.5
+# carla is OPTIONAL and only needed for real (non-mock) runs on the
+# machine that hosts the CARLA simulator. Install it to match your
+# CARLA server version, e.g.:  pip install carla==0.9.15

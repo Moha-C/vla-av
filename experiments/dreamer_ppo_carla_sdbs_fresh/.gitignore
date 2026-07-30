@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env_local/
+*.pt
+*.ckpt
+runs/
+logs/
+checkpoints/
+data/trajectories.pkl
+data/prediction_checkpoints/
+demo_plots/
+.DS_Store
+.idea/
+.vscode/

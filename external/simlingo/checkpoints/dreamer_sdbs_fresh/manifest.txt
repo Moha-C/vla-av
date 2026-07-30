@@ -1,0 +1,8 @@
+Youma SDBS fresh checkpoint installed
+installed_at=2026-07-16T10:36:47+02:00
+source_train_dir=/home/mohm/Desktop/vla-av/experiments/dreamer_ppo_carla_sdbs_fresh/outputs/sdbs_fresh_from_teacher_20260716_103316
+source_dataset=/home/mohm/Desktop/vla-av/experiments/dreamer_ppo_carla_sdbs_fresh/data/sdbs_teacher_20260716_103316.npz
+teacher_traces:
+- /home/mohm/Desktop/vla-av/logs/action_dreaming_collect/action_dreaming_20260715_150111.jsonl
+- /home/mohm/Desktop/vla-av/logs/action_dreaming_collect/action_dreaming_20260715_154252.jsonl
+- /home/mohm/Desktop/vla-av/logs/action_dreaming_collect/action_dreaming_20260716_101125.jsonl

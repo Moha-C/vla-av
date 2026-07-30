@@ -1,0 +1,33 @@
+default_model: generic.qwen3:1.7b
+
+providers:
+  generic:
+    api_key: "ollama"
+    base_url: "http://localhost:11434/v1"
+
+logger:
+  level: "info"
+  type: "console"
+  progress_display: true
+  show_chat: true
+  show_tools: true
+  truncate_tools: true
+
+# mcp:
+#   servers:
+#     mylocal:
+#       transport: http
+#       url: "http://localhost:8000/mcp"
+#       timeout: 30
+mcp:
+  servers:
+    streamable_http_server:
+      transport: "http"
+      url: "http://127.0.0.1:8000/mcp"
+      read_transport_sse_timeout_seconds: 300
+      headers:
+        Authorization: "Bearer token"
+
+#fast-agent go --url=http://127.0.0.1:8000/mcp --auth=token
+
+##uv run agent.py

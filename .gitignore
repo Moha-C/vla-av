@@ -1,0 +1,73 @@
+# Python/runtime noise
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments and caches
+.cache/
+.conda_node/
+.venv/
+venv/
+env/
+
+# CARLA/SUMO generated runtime outputs
+logs/
+generated_routes/
+generated_sumo_nets/
+generated_sumo_routes/
+
+# Large local backups / temporary research exports
+vm_backups/
+backup_1ere_version/
+backups/
+trash/
+artifacts/
+exports/
+SUMO_Project.zip
+
+# Large model and pretrained downloads. Use the download scripts instead.
+models/
+pretrained/
+
+# Keep the small runtime Dreamer checkpoints that are part of this integration.
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+!external/simlingo/checkpoints/dreamer_guard/best_world_model.pt
+!external/simlingo/checkpoints/dreamer_sdbs_fresh/best_world_model.pt
+!external/simlingo/checkpoints/dreamer_ppo_rl_noguard/init_guarded_world_model.pt
+!external/simlingo/checkpoints/dreamer_sdbs_rl_noguard/init_guarded_world_model.pt
+!external/simlingo/checkpoints/dreamer_ppo_rl_noguard/latest_rl_model.pt
+!external/simlingo/checkpoints/dreamer_sdbs_rl_noguard/latest_rl_model.pt
+
+# Never commit videos, datasets, run archives, or raw notebooks outputs by default.
+*.mp4
+*.webm
+*.avi
+*.mov
+*.mkv
+*.zip
+*.tar
+*.tar.gz
+*.tar.zst
+*.7z
+*.npz
+*.npy
+*.pkl
+*.parquet
+*.jsonl
+
+# TwinSentinel vendored code is useful, but its cloned git history, map packs,
+# and experiment runs are too large for the main repository.
+experiments/TwinSentinel_Project/.git/
+experiments/TwinSentinel_Project/runs/
+experiments/TwinSentinel_Project/maps/
+
+# Nested upstream git histories should be handled as submodules or flattened
+# deliberately before the first root commit.
+external/*/.git/
+experiments/*/.git/

@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Debug Dashboard</title>
+    <style>
+        body { font-family: monospace; padding: 20px; background: #1e1e1e; color: #d4d4d4; }
+        button { background: #007acc; color: white; border: none; padding: 10px; margin: 5px; cursor: pointer; }
+        button:hover { background: #0098ff; }
+        .section { margin: 20px 0; padding: 10px; background: #252526; border-left: 3px solid #007acc; }
+        .log { background: #1e1e1e; padding: 10px; margin: 5px 0; max-height: 300px; overflow-y: auto; border: 1px solid #444; }
+        code { background: #2d2d30; padding: 2px 5px; }
+    </style>
+</head>
+<body>
+    <h1>Dashboard Debug Console</h1>
+    
+    <div class="section">
+        <h2>localStorage / Cache Controls</h2>
+        <button onclick="clearStorage()">Clear ALL localStorage</button>
+        <button onclick="clearBaselines()">Clear baseline keys only</button>
+        <button onclick="showStorage()">Show localStorage contents</button>
+        <button onclick="reloadApp()">Reload main app (dashboard)</button>
+        <div id="storageLog" class="log"></div>
+    </div>
+
+    <div class="section">
+        <h2>API Tests</h2>
+        <button onclick="testBaselineAPI('basic')">Test: GET baseline/current?map_name=basic</button>
+        <button onclick="testBaselineAPI('paris')">Test: GET baseline/current?map_name=paris</button>
+        <button onclick="testLoadAPI('basic', true)">Test: POST baseline/load (basic, force_reload=true)</button>
+        <button onclick="testLoadAPI('paris', true)">Test: POST baseline/load (paris, force_reload=true)</button>
+        <button onclick="testHistoryAPI()">Test: GET /api/history?limit=1</button>
+        <div id="apiLog" class="log"></div>
+    </div>
+
+    <div class="section">
+        <h2>Plugin Tests</h2>
+        <button onclick="checkZoomPlugin()">Check Chart.js Zoom Plugin</button>
+        <button onclick="checkChartLoaded()">Check Chart.js loaded</button>
+        <div id="pluginLog" class="log"></div>
+    </div>
+
+    <script>
+        const storageLog = document.getElementById('storageLog');
+        const apiLog = document.getElementById('apiLog');
+        const pluginLog = document.getElementById('pluginLog');
+
+        function log(element, msg) {
+            const time = new Date().toLocaleTimeString();
+            const entry = document.createElement('div');
+            entry.textContent = `[${time}] ${msg}`;
+            element.appendChild(entry);
+            element.scrollTop = element.scrollHeight;
+        }
+
+        function clearStorage() {
+            localStorage.clear();
+            log(storageLog, '✓ localStorage cleared');
+            showStorage();
+        }
+
+        function clearBaselines() {
+            const keys = Object.keys(localStorage).filter(k => k.includes('vanet') || k.includes('baseline'));
+            keys.forEach(k => localStorage.removeItem(k));
+            log(storageLog, `✓ Cleared ${keys.length} vANET keys: ${keys.join(', ')}`);
+            showStorage();
+        }
+
+        function showStorage() {
+            storageLog.innerHTML = '';
+            const keys = Object.keys(localStorage);
+            if (!keys.length) {
+                log(storageLog, '(empty)');
+                return;
+            }
+            keys.forEach(k => {
+                const val = localStorage.getItem(k);
+                const preview = val.length > 80 ? val.substring(0, 80) + '...' : val;
+                log(storageLog, `${k}: ${preview}`);
+            });
+        }
+
+        function reloadApp() {
+            log(storageLog, 'Reloading dashboard...');
+            setTimeout(() => window.location.href = '/', 500);
+        }
+
+        async function testBaselineAPI(map) {
+            apiLog.innerHTML = '';
+            try {
+                log(apiLog, `Fetching baseline for "${map}"...`);
+                const res = await fetch(`/api/baseline/current?map_name=${map}`);
+                const json = await res.json();
+                
+                log(apiLog, `Status: ${res.status}`);
+                log(apiLog, `map_name: ${json.map_name}`);
+                log(apiLog, `count: ${json.count}`);
+                
+                if (json.baseline && json.baseline.length > 0) {
+                    const last = json.baseline[json.baseline.length - 1];
+                    log(apiLog, `last simulation_time: ${last.simulation_time}`);
+                    log(apiLog, `last metrics: ${JSON.stringify(last.metrics).substring(0, 100)}...`);
+                } else {
+                    log(apiLog, 'No baseline data');
+                }
+            } catch (error) {
+                log(apiLog, `ERROR: ${error.message}`);
+            }
+        }
+
+        async function testLoadAPI(map, forceReload) {
+            apiLog.innerHTML = '';
+            try {
+                log(apiLog, `POST /api/baseline/load (${map}, force_reload=${forceReload})...`);
+                const res = await fetch('/api/baseline/load', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ map_name: map, force_reload: forceReload })
+                });
+                const json = await res.json();
+                
+                log(apiLog, `Status: ${res.status}`);
+                log(apiLog, `Response: ${JSON.stringify(json, null, 2)}`);
+            } catch (error) {
+                log(apiLog, `ERROR: ${error.message}`);
+            }
+        }
+
+        async function testHistoryAPI() {
+            apiLog.innerHTML = '';
+            try {
+                log(apiLog, 'Fetching /api/history?limit=1...');
+                const res = await fetch('/api/history?limit=1');
+                const json = await res.json();
+                
+                if (json.error) {
+                    log(apiLog, `API Error: ${json.error}`);
+                } else {
+                    log(apiLog, `Status: ${res.status}`);
+                    log(apiLog, `Live data available: ${JSON.stringify(json).substring(0, 150)}...`);
+                }
+            } catch (error) {
+                log(apiLog, `ERROR: ${error.message}`);
+            }
+        }
+
+        function checkZoomPlugin() {
+            pluginLog.innerHTML = '';
+            const globals = [
+                'ChartZoom',
+                'chartjsPluginZoom',
+                'chartjs_plugin_zoom',
+                'chartjs-plugin-zoom',
+                'Chart'
+            ];
+            
+            log(pluginLog, 'Checking for zoom plugin...');
+            globals.forEach(g => {
+                const exists = typeof window[g] !== 'undefined';
+                log(pluginLog, `window.${g}: ${exists ? '✓ found' : '✗ not found'}`);
+            });
+            
+            if (typeof Chart !== 'undefined' && Chart.plugins) {
+                log(pluginLog, `Chart.plugins registered: ${Chart.plugins.count}`);
+            }
+        }
+
+        function checkChartLoaded() {
+            pluginLog.innerHTML = '';
+            log(pluginLog, `Chart.js version: ${typeof Chart !== 'undefined' ? (Chart.version || 'unknown') : 'NOT LOADED'}`);
+            log(pluginLog, `typeof Chart: ${typeof Chart}`);
+        }
+
+        // Auto-show storage on load
+        window.addEventListener('load', showStorage);
+    </script>
+</body>
+</html>

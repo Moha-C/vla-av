@@ -1,0 +1,136 @@
+{
+  "checkpoint": "outputs/simlingo_world_model_20260616/best_world_model.pt",
+  "csv": "outputs/simlingo_vs_dreamer_benchmark_wrisk2/per_sample.csv",
+  "dreamer_candidate_index_counts": {
+    "0": 858,
+    "1": 311,
+    "2": 340,
+    "3": 245,
+    "4": 175,
+    "5": 213,
+    "6": 386
+  },
+  "dreamer_same_as_meta_best_rate": 0.33939873417721517,
+  "dreamer_same_as_simlingo_rate": 0.33939873417721517,
+  "jsonl": "/home/mohm/Desktop/vla-av-simlingo-dev/data/action_dreaming_adv/filtered/batch_town12_13_20260616_filtered.jsonl",
+  "metrics": {
+    "dreamer_best_progress": {
+      "max": 0.047723691910505295,
+      "mean": 0.0042869639582931995,
+      "median": 0.0031872461549937725,
+      "min": -0.015478063374757767
+    },
+    "dreamer_best_risk": {
+      "max": 0.9908080697059631,
+      "mean": 0.2207537740468979,
+      "median": 0.11625241488218307,
+      "min": 2.473247604939388e-06
+    },
+    "dreamer_score_delta_vs_simlingo": {
+      "max": 0.636687695980072,
+      "mean": 0.03550887480378151,
+      "median": 0.0073030684143304825,
+      "min": 0.0
+    },
+    "meta_progress_delta_vs_simlingo": {
+      "max": 0.5656391382217407,
+      "mean": -0.06095432490110397,
+      "median": 0.0,
+      "min": -0.7502293586730957
+    },
+    "meta_risk_delta_vs_simlingo": {
+      "max": 1.0,
+      "mean": 0.003704691305756569,
+      "median": 0.0,
+      "min": -0.18955011665821075
+    },
+    "meta_score_delta_vs_simlingo": {
+      "max": 0.0,
+      "mean": -0.10003557056188583,
+      "median": -0.012284772470593452,
+      "min": -2.4372670650482178
+    }
+  },
+  "samples": 2528,
+  "scenario_summary": {
+    "Accident": {
+      "dreamer_same_as_meta_best_rate": 0.17692307692307693,
+      "dreamer_same_as_simlingo_rate": 0.17692307692307693,
+      "samples": 260
+    },
+    "AccidentTwoWays": {
+      "dreamer_same_as_meta_best_rate": 0.4076923076923077,
+      "dreamer_same_as_simlingo_rate": 0.4076923076923077,
+      "samples": 130
+    },
+    "CrossingBicycleFlow": {
+      "dreamer_same_as_meta_best_rate": 0.3125,
+      "dreamer_same_as_simlingo_rate": 0.3125,
+      "samples": 160
+    },
+    "DynamicObjectCrossing": {
+      "dreamer_same_as_meta_best_rate": 0.48125,
+      "dreamer_same_as_simlingo_rate": 0.48125,
+      "samples": 160
+    },
+    "HardBreakRoute": {
+      "dreamer_same_as_meta_best_rate": 0.20253164556962025,
+      "dreamer_same_as_simlingo_rate": 0.20253164556962025,
+      "samples": 79
+    },
+    "HighwayCutIn": {
+      "dreamer_same_as_meta_best_rate": 0.3625,
+      "dreamer_same_as_simlingo_rate": 0.3625,
+      "samples": 320
+    },
+    "HighwayExit": {
+      "dreamer_same_as_meta_best_rate": 0.2375,
+      "dreamer_same_as_simlingo_rate": 0.2375,
+      "samples": 160
+    },
+    "MergerIntoSlowTraffic": {
+      "dreamer_same_as_meta_best_rate": 0.3625,
+      "dreamer_same_as_simlingo_rate": 0.3625,
+      "samples": 160
+    },
+    "MergerIntoSlowTrafficV2": {
+      "dreamer_same_as_meta_best_rate": 0.36908517350157727,
+      "dreamer_same_as_simlingo_rate": 0.36908517350157727,
+      "samples": 317
+    },
+    "ParkingCrossingPedestrian": {
+      "dreamer_same_as_meta_best_rate": 0.2625,
+      "dreamer_same_as_simlingo_rate": 0.2625,
+      "samples": 160
+    },
+    "PedestrianCrossing": {
+      "dreamer_same_as_meta_best_rate": 0.6041666666666666,
+      "dreamer_same_as_simlingo_rate": 0.6041666666666666,
+      "samples": 144
+    },
+    "SequentialLaneChange": {
+      "dreamer_same_as_meta_best_rate": 0.25625,
+      "dreamer_same_as_simlingo_rate": 0.25625,
+      "samples": 160
+    },
+    "VanillaNonSignalizedTurn": {
+      "dreamer_same_as_meta_best_rate": 0.3125,
+      "dreamer_same_as_simlingo_rate": 0.3125,
+      "samples": 160
+    },
+    "VanillaSignalizedTurnEncounterRedLight": {
+      "dreamer_same_as_meta_best_rate": 0.4262295081967213,
+      "dreamer_same_as_simlingo_rate": 0.4262295081967213,
+      "samples": 61
+    },
+    "VehicleTurningRoutePedestrian": {
+      "dreamer_same_as_meta_best_rate": 0.422680412371134,
+      "dreamer_same_as_simlingo_rate": 0.422680412371134,
+      "samples": 97
+    }
+  },
+  "weights": {
+    "w_progress": 1.0,
+    "w_risk": 2.0
+  }
+}

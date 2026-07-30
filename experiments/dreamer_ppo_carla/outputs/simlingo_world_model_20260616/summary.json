@@ -1,0 +1,12 @@
+{
+  "best": {
+    "epoch": 27,
+    "train_loss": 0.9897095179185271,
+    "loss": 0.937030328437686,
+    "state_mae_norm": 0.0690397284924984,
+    "risk_mae": 0.12268595024943352,
+    "progress_mae_norm": 0.20213723927736282
+  },
+  "transitions": 2509,
+  "data": "data/simlingo_ad_filtered_20260616.npz"
+}

@@ -1,0 +1,4 @@
+source=init_guarded_world_model.pt
+status=seed checkpoint copied for dashboard RL no-guard option; replace after real validated RL training
+installed_at=2026-07-30T15:12:48+02:00
+kind=sdbs
