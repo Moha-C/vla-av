@@ -10,6 +10,17 @@ import torch
 import torch.nn as nn
 
 
+def _module_device(module):
+    return next(module.parameters()).device
+
+
+def _to_device(batch, device):
+    return {
+        key: value.to(device) if torch.is_tensor(value) else value
+        for key, value in batch.items()
+    }
+
+
 class WorldModelTrainer:
     def __init__(self, world_model, config):
         self.model = world_model
@@ -32,6 +43,7 @@ class WorldModelTrainer:
 
     def update(self, batch):
         """One gradient step on a (mini)batch. Returns a dict of scalar losses."""
+        batch = _to_device(batch, _module_device(self.model))
         states, actions, next_states, risk_targets, progress_targets = \
             self._unpack(batch)
 
@@ -62,6 +74,7 @@ class WorldModelTrainer:
     @torch.no_grad()
     def evaluate(self, batch, n_samples=100):
         """Mean absolute prediction error on up to `n_samples` rows."""
+        batch = _to_device(batch, _module_device(self.model))
         states, actions, next_states, risk_targets, progress_targets = \
             self._unpack(batch)
 
