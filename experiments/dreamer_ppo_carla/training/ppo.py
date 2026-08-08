@@ -3,9 +3,21 @@ import torch
 import torch.nn as nn
 
 
+def _module_device(module):
+    return next(module.parameters()).device
+
+
+def _to_device(batch, device):
+    return {
+        key: value.to(device) if torch.is_tensor(value) else value
+        for key, value in batch.items()
+    }
+
+
 def update_ppo(policy, optimizer, batch, clip_eps=0.2, ent_coef=0.01,
                vf_coef=0.5, max_grad_norm=0.5):
     """One PPO update over a (mini)batch. Returns a dict of scalar losses."""
+    batch = _to_device(batch, _module_device(policy))
     states = batch["states"]
     actions = batch["actions"]          # raw (pre-squash) actions
     old_log_probs = batch["log_probs"]
@@ -43,6 +55,7 @@ def update_ppo(policy, optimizer, batch, clip_eps=0.2, ent_coef=0.01,
 
 def update_world_model(world_model, optimizer, batch, max_grad_norm=0.5):
     """One world-model regression update. Returns a dict of scalar losses."""
+    batch = _to_device(batch, _module_device(world_model))
     states = batch["states"]
     actions = batch["actions"]
     next_states = batch["next_states"]

@@ -1,4 +1,9 @@
-source=init_guarded_world_model.pt
-status=seed checkpoint copied for dashboard RL no-guard option; replace after real validated RL training
-installed_at=2026-07-30T15:12:48+02:00
-kind=ppo
+source=clean_guarded_v1_teacher_distillation
+summary=logs/dreamer_rl_distillation/20260806_174350/summary.json
+checkpoint=external/simlingo/checkpoints/dreamer_ppo_rl_noguard/latest_rl_model.pt
+backup=external/simlingo/checkpoints/dreamer_ppo_rl_noguard/rollback_backups/latest_rl_model_before_teacher_bootstrap_20260806_174350.pt
+policy_role=online_rl_no_guard_temporal_complement_bootstrapped_from_clean_v1
+policy_input_semantics=world_state_plus_simlingo_temporal_context_v4
+policy_action_semantics=simlingo_signed_longitudinal_target_with_learned_gate_v3
+runtime_guard=false
+samples=2208
