@@ -25,6 +25,10 @@ LIGHT_TO_FLOAT = {
     "none": 2.0,
     None: 2.0,
 }
+MAP_INVARIANT_POLICY_INPUT_SEMANTICS = (
+    "world_state_plus_simlingo_map_invariant_temporal_context_v5"
+)
+MAP_INVARIANT_WORLD_STATE_INDICES = (0, 1, 3)
 
 
 class WorldModel(nn.Module):
@@ -43,6 +47,45 @@ class WorldModel(nn.Module):
         x = self.relu(self.fc1(x))
         x = self.relu(self.fc2(x))
         return self.head_state(x), self.sigmoid(self.head_risk(x)), self.head_progress(x)
+
+
+class ActorCritic(nn.Module):
+    """PPO actor-critic used by the no-guard online RL Dreamer variants."""
+
+    def __init__(self, state_dim: int = 28, action_dim: int = 4, hidden: int = 256):
+        super().__init__()
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.trunk = nn.Sequential(
+            nn.Linear(state_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+        )
+        self.actor_mean = nn.Linear(hidden, action_dim)
+        self.log_std = nn.Parameter(torch.zeros(action_dim) - 0.5)
+        self.critic = nn.Linear(hidden, 1)
+
+    @staticmethod
+    def _squash(raw):
+        steering = torch.tanh(raw[..., 0:1])
+        rest = torch.sigmoid(raw[..., 1:4])
+        return torch.cat([steering, rest], dim=-1)
+
+    def forward(self, state):
+        h = self.trunk(state)
+        mean = self.actor_mean(h)
+        std = torch.exp(self.log_std).expand_as(mean)
+        value = self.critic(h).squeeze(-1)
+        return mean, std, value
+
+    def act(self, state, deterministic: bool = False):
+        mean, std, value = self.forward(state)
+        dist = torch.distributions.Normal(mean, std)
+        raw_action = mean if deterministic else dist.sample()
+        log_prob = dist.log_prob(raw_action).sum(-1)
+        action = self._squash(raw_action)
+        return action.detach(), log_prob.detach(), value.detach(), raw_action.detach()
 
 
 @dataclass
@@ -101,6 +144,14 @@ class GuardConfig:
     collision_shield_risk: float = 0.72
     collision_shield_min_speed: float = 0.25
     collision_shield_brake: float = 0.78
+    rl_training: bool = False
+    rl_action_space: str = "residual"
+    rl_steer_scale: float = 0.30
+    rl_throttle_delta: float = 0.70
+    rl_brake_delta: float = 1.00
+    rl_continue_throttle: float = 0.32
+    rl_deterministic_eval: bool = True
+    rl_policy_input_norm: str = "fixed"
 
 
 def _enabled_value(value: str) -> bool:
@@ -178,6 +229,37 @@ class DreamerGuard:
         self.model = WorldModel(state_dim=state_dim, action_dim=action_dim, hidden=hidden).to(self.device)
         self.model.load_state_dict(state_dict)
         self.model.eval()
+        self.policy: Optional[ActorCritic] = None
+        self.policy_state_dim = state_dim
+        self.policy_action_dim = action_dim
+        self.policy_input_semantics = str(ckpt.get("policy_input_semantics", "world_state_v1"))
+        self.policy_action_semantics = str(
+            ckpt.get("policy_action_semantics", "simlingo_residual_with_learned_gate_v1")
+        )
+        if self.policy_action_semantics in (
+            "simlingo_target_control_with_learned_gate_v2",
+            "simlingo_signed_longitudinal_target_with_learned_gate_v3",
+        ):
+            # The checkpoint defines how its four outputs must be decoded. This
+            # prevents an old dashboard/default environment value from silently
+            # interpreting an absolute-control policy as a residual policy.
+            self.config.rl_action_space = "absolute"
+        policy_dict = ckpt.get("policy")
+        if policy_dict is not None:
+            trunk_weight = policy_dict.get("trunk.0.weight")
+            log_std = policy_dict.get("log_std")
+            if trunk_weight is None or log_std is None:
+                raise KeyError("Dreamer RL checkpoint policy is missing trunk.0.weight or log_std.")
+            policy_hidden = int(trunk_weight.shape[0])
+            self.policy_state_dim = int(trunk_weight.shape[1])
+            self.policy_action_dim = int(log_std.shape[0])
+            self.policy = ActorCritic(
+                state_dim=self.policy_state_dim,
+                action_dim=self.policy_action_dim,
+                hidden=policy_hidden,
+            ).to(self.device)
+            self.policy.load_state_dict(policy_dict)
+            self.policy.eval()
         self.state_dim = state_dim
         self.checkpoint_schema = checkpoint_schema
 
@@ -191,6 +273,7 @@ class DreamerGuard:
             dtype=torch.float32,
             device=self.device,
         ).clamp_min(1e-6)
+        self.policy_state_mean, self.policy_state_std = self._policy_normalizer_from_checkpoint(ckpt)
         self.action_mean = torch.as_tensor(
             ckpt.get("action_mean", np.zeros(action_dim, dtype=np.float32)),
             dtype=torch.float32,
@@ -217,12 +300,15 @@ class DreamerGuard:
         self.recovery_side = 0
         self.recovery_commit_ticks = 0
         self.recovery_finish_active_ticks = 0
+        self.previous_rl_policy_action: Optional[np.ndarray] = None
         self._candidate_meta: List[Dict[str, Any]] = []
 
     @classmethod
     def from_env(cls) -> Optional["DreamerGuard"]:
         enabled = os.environ.get("SIMLINGO_DREAMER_GUARD", "0")
-        if not _enabled_value(enabled):
+        runtime = os.environ.get("SIMLINGO_DREAMER_RUNTIME", "").lower()
+        rl_noguard = runtime == "rl_noguard"
+        if not _enabled_value(enabled) and not rl_noguard:
             return None
 
         checkpoint = os.environ.get("SIMLINGO_DREAMER_CHECKPOINT")
@@ -237,11 +323,11 @@ class DreamerGuard:
             print(f"SIMLINGO_DREAMER_GUARD disabled: checkpoint not found: {checkpoint}", flush=True)
             return None
 
-        mode = os.environ.get("SIMLINGO_DREAMER_GUARD_MODE", "apply").lower()
+        mode = "rl_noguard" if rl_noguard else os.environ.get("SIMLINGO_DREAMER_GUARD_MODE", "apply").lower()
         if enabled.lower() == "shadow":
             mode = "shadow"
         variant = os.environ.get("SIMLINGO_DREAMER_VARIANT", "dreamer_guard_v1")
-        recovery_default = "accident" in variant or "overtake" in variant
+        recovery_default = False if rl_noguard else ("accident" in variant or "overtake" in variant)
         config = GuardConfig(
             checkpoint=checkpoint,
             mode=mode,
@@ -257,7 +343,7 @@ class DreamerGuard:
             w_risk=_as_float(os.environ.get("SIMLINGO_DREAMER_W_RISK"), 2.0),
             action_penalty=_as_float(os.environ.get("SIMLINGO_DREAMER_ACTION_PENALTY"), 0.08),
             log_every=max(1, int(_as_float(os.environ.get("SIMLINGO_DREAMER_LOG_EVERY"), 40))),
-            recovery_enabled=_as_bool(os.environ.get("SIMLINGO_DREAMER_RECOVERY"), recovery_default),
+            recovery_enabled=False if rl_noguard else _as_bool(os.environ.get("SIMLINGO_DREAMER_RECOVERY"), recovery_default),
             recovery_min_ticks=max(0, int(_as_float(os.environ.get("SIMLINGO_DREAMER_RECOVERY_MIN_TICKS"), 8))),
             recovery_front_m=_as_float(os.environ.get("SIMLINGO_DREAMER_RECOVERY_FRONT_M"), 18.0),
             recovery_clearance_m=_as_float(os.environ.get("SIMLINGO_DREAMER_RECOVERY_CLEARANCE_M"), 14.0),
@@ -292,19 +378,42 @@ class DreamerGuard:
             recovery_finish_ticks=max(0, int(_as_float(os.environ.get("SIMLINGO_DREAMER_RECOVERY_FINISH_TICKS"), 34))),
             recovery_finish_steer_scale=_as_float(os.environ.get("SIMLINGO_DREAMER_RECOVERY_FINISH_STEER_SCALE"), 0.42),
             recovery_finish_throttle=_as_float(os.environ.get("SIMLINGO_DREAMER_RECOVERY_FINISH_THROTTLE"), 0.42),
-            collision_shield_enabled=_as_bool(os.environ.get("SIMLINGO_DREAMER_COLLISION_SHIELD"), False),
+            collision_shield_enabled=False if rl_noguard else _as_bool(os.environ.get("SIMLINGO_DREAMER_COLLISION_SHIELD"), False),
             collision_shield_front_m=_as_float(os.environ.get("SIMLINGO_DREAMER_COLLISION_SHIELD_FRONT_M"), 12.0),
             collision_shield_risk=_as_float(os.environ.get("SIMLINGO_DREAMER_COLLISION_SHIELD_RISK"), 0.72),
             collision_shield_min_speed=_as_float(os.environ.get("SIMLINGO_DREAMER_COLLISION_SHIELD_MIN_SPEED"), 0.25),
             collision_shield_brake=_as_float(os.environ.get("SIMLINGO_DREAMER_COLLISION_SHIELD_BRAKE"), 0.78),
+            rl_training=_as_bool(os.environ.get("SIMLINGO_DREAMER_RL_TRAINING"), False),
+            rl_action_space=os.environ.get("SIMLINGO_DREAMER_RL_ACTION_SPACE", "residual").lower(),
+            rl_steer_scale=_as_float(os.environ.get("SIMLINGO_DREAMER_RL_STEER_SCALE"), 0.30),
+            rl_throttle_delta=_as_float(os.environ.get("SIMLINGO_DREAMER_RL_THROTTLE_DELTA"), 0.70),
+            rl_brake_delta=_as_float(os.environ.get("SIMLINGO_DREAMER_RL_BRAKE_DELTA"), 1.00),
+            rl_continue_throttle=_as_float(os.environ.get("SIMLINGO_DREAMER_RL_CONTINUE_THROTTLE"), 0.32),
+            rl_deterministic_eval=_as_bool(os.environ.get("SIMLINGO_DREAMER_RL_DETERMINISTIC_EVAL"), True),
+            rl_policy_input_norm=os.environ.get("SIMLINGO_DREAMER_RL_POLICY_INPUT_NORM", "fixed").lower(),
         )
         guard = cls(config)
-        print(
-            "SIMLINGO_DREAMER_GUARD enabled: "
-            f"variant={config.variant} mode={config.mode} checkpoint={config.checkpoint} "
-            f"risk_margin={config.risk_margin} max_progress_drop={config.max_progress_drop}",
-            flush=True,
-        )
+        if rl_noguard:
+            if guard.policy is None:
+                print(
+                    "SIMLINGO_DREAMER_RL_NOGUARD disabled: checkpoint has no PPO policy head.",
+                    flush=True,
+                )
+                return None
+            print(
+                "SIMLINGO_DREAMER_RL_NOGUARD enabled: "
+                f"variant={config.variant} mode={config.mode} checkpoint={config.checkpoint} "
+                f"guard=0 recovery=0 collision_shield=0 training={int(config.rl_training)} "
+                f"action_space={config.rl_action_space} policy_norm={config.rl_policy_input_norm}",
+                flush=True,
+            )
+        else:
+            print(
+                "SIMLINGO_DREAMER_GUARD enabled: "
+                f"variant={config.variant} mode={config.mode} checkpoint={config.checkpoint} "
+                f"risk_margin={config.risk_margin} max_progress_drop={config.max_progress_drop}",
+                flush=True,
+            )
         print(
             f"SIMLINGO_DREAMER_CHECKPOINT schema={guard.checkpoint_schema} "
             f"state_dim={guard.state_dim}",
@@ -437,6 +546,8 @@ class DreamerGuard:
                     lateral_m = dx * right.x + dy * right.y
                     dist = math.sqrt(dx * dx + dy * dy)
                     if type_id.startswith("vehicle."):
+                        if any(token in type_id.lower() for token in ("bike", "bicycle", "crossbike", "diamondback", "gazelle")):
+                            nearest_bike_m = min(nearest_bike_m, dist)
                         actor_long_speed = _actor_longitudinal_speed(actor, forward)
                         actor_rel_long_speed = actor_long_speed - hero_longitudinal_speed
                         actor_heading_dot = 1.0
@@ -584,6 +695,8 @@ class DreamerGuard:
             "speed": speed,
             "front_vehicle_m": front_vehicle_m,
             "nearest_vehicle_m": nearest_vehicle_m,
+            "nearest_walker_m": nearest_walker_m,
+            "nearest_bike_m": nearest_bike_m,
             "left_front_m": left_front_m,
             "left_rear_m": left_rear_m,
             "right_front_m": right_front_m,
@@ -631,7 +744,19 @@ class DreamerGuard:
         return blocked_by_front and (speed <= 0.9 or base_stopped or slow_gap_approach)
 
     def _update_blocked_ticks(self, base_action: np.ndarray, context: Dict[str, float]) -> None:
-        if self._recovery_context(base_action, context):
+        if self.config.mode == "rl_noguard":
+            light = context.get("traffic_light")
+            speed = float(context.get("speed", 0.0))
+            front_m = float(context.get("front_vehicle_m", 80.0))
+            base_stopped = float(base_action[1]) <= 0.08 and float(base_action[2]) >= 0.45
+            blocked = (
+                light not in ("red", "yellow")
+                and front_m <= 18.0
+                and (speed <= 0.9 or base_stopped)
+            )
+        else:
+            blocked = self._recovery_context(base_action, context)
+        if blocked:
             self.blocked_ticks += 1
         else:
             self.blocked_ticks = 0
@@ -901,6 +1026,251 @@ class DreamerGuard:
             return False
         return float(context.get("front_vehicle_m", 80.0)) <= self.config.recovery_exit_front_m
 
+    @staticmethod
+    def _default_policy_state_scale(dim: int) -> np.ndarray:
+        scale = np.ones(max(dim, 44), dtype=np.float32)
+        scale[0] = 1000.0
+        scale[1] = 1000.0
+        scale[2] = 15.0
+        scale[3] = math.pi
+        scale[4] = 8.0
+        scale[6] = 8.0
+        scale[8] = math.pi
+        scale[10] = 2.0
+        scale[11] = 50.0
+        for idx in (13, 16, 18, 21, 23, 26):
+            scale[idx] = 80.0
+        for idx in (14, 19, 20, 24, 25):
+            scale[idx] = 20.0
+        if dim >= 44:
+            # 28:31 SimLingo control, 31 blocked ticks, then lane geometry.
+            scale[31] = 200.0
+            for idx in (32, 33, 34, 35, 38, 39):
+                scale[idx] = 80.0
+            for idx in (36, 37, 40, 41):
+                scale[idx] = 20.0
+        return scale[:dim]
+
+    def _policy_normalizer_from_checkpoint(self, ckpt: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.config.rl_policy_input_norm in ("0", "none", "raw", "off"):
+            mean = np.zeros(self.policy_state_dim, dtype=np.float32)
+            std = np.ones(self.policy_state_dim, dtype=np.float32)
+        else:
+            mean_raw = ckpt.get("policy_state_mean", ckpt.get("state_mean"))
+            std_raw = ckpt.get("policy_state_std", ckpt.get("state_std"))
+            if mean_raw is None or std_raw is None:
+                mean = np.zeros(self.policy_state_dim, dtype=np.float32)
+                std = self._default_policy_state_scale(self.policy_state_dim)
+            else:
+                mean = np.asarray(mean_raw, dtype=np.float32).reshape(-1)
+                std = np.asarray(std_raw, dtype=np.float32).reshape(-1)
+                if mean.shape[0] < self.policy_state_dim:
+                    mean = np.pad(mean, (0, self.policy_state_dim - mean.shape[0]), mode="constant")
+                if std.shape[0] < self.policy_state_dim:
+                    std = np.pad(
+                        std,
+                        (0, self.policy_state_dim - std.shape[0]),
+                        mode="constant",
+                        constant_values=1.0,
+                    )
+                mean = mean[: self.policy_state_dim]
+                std = std[: self.policy_state_dim]
+        return (
+            torch.as_tensor(mean, dtype=torch.float32, device=self.device),
+            torch.as_tensor(std, dtype=torch.float32, device=self.device).clamp_min(1e-6),
+        )
+
+    def _policy_observation(
+        self,
+        state: np.ndarray,
+        base_action: np.ndarray,
+        context: Dict[str, float],
+    ) -> np.ndarray:
+        state_np = np.asarray(state, dtype=np.float32).reshape(-1)
+        if self.policy_input_semantics == "world_state_plus_simlingo_context_v2":
+            base = np.asarray(base_action, dtype=np.float32).reshape(-1)
+            if base.shape[0] < 3:
+                base = np.pad(base, (0, 3 - base.shape[0]), mode="constant")
+            context_values = np.asarray([
+                float(context.get("blocked_ticks", 0.0)),
+                float(context.get("left_front_m", 80.0)),
+                float(context.get("left_rear_m", 80.0)),
+                float(context.get("right_front_m", 80.0)),
+                float(context.get("right_rear_m", 80.0)),
+                float(context.get("left_ttc_s", 99.0)),
+                float(context.get("right_ttc_s", 99.0)),
+                float(context.get("left_oncoming_m", 80.0)),
+                float(context.get("right_oncoming_m", 80.0)),
+                float(context.get("left_oncoming_ttc_s", 99.0)),
+                float(context.get("right_oncoming_ttc_s", 99.0)),
+                float(context.get("left_lane_available", 1.0)),
+                float(context.get("right_lane_available", 1.0)),
+            ], dtype=np.float32)
+            state_np = np.concatenate([state_np[: self.state_dim], base[:3], context_values])
+        elif self.policy_input_semantics in (
+            "world_state_plus_simlingo_compact_context_v3",
+            "world_state_plus_simlingo_temporal_context_v4",
+            MAP_INVARIANT_POLICY_INPUT_SEMANTICS,
+        ):
+            base = np.asarray(base_action, dtype=np.float32).reshape(-1)
+            if base.shape[0] < 3:
+                base = np.pad(base, (0, 3 - base.shape[0]), mode="constant")
+            left_clear = min(
+                float(context.get("left_front_m", context.get("left_clear_m", 80.0))),
+                float(context.get("left_rear_m", context.get("left_clear_m", 80.0))),
+            )
+            right_clear = min(
+                float(context.get("right_front_m", context.get("right_clear_m", 80.0))),
+                float(context.get("right_rear_m", context.get("right_clear_m", 80.0))),
+            )
+            context_values = np.asarray([
+                float(context.get("blocked_ticks", 0.0)),
+                left_clear,
+                right_clear,
+                float(context.get("left_ttc_s", 99.0)),
+                float(context.get("right_ttc_s", 99.0)),
+                float(context.get("left_oncoming_m", 80.0)),
+                float(context.get("right_oncoming_m", 80.0)),
+                float(context.get("left_oncoming_ttc_s", 99.0)),
+                float(context.get("right_oncoming_ttc_s", 99.0)),
+                float(context.get("left_lane_available", 1.0)),
+                float(context.get("right_lane_available", 1.0)),
+            ], dtype=np.float32)
+            policy_world_state = state_np[: self.state_dim].copy()
+            if self.policy_input_semantics == MAP_INVARIANT_POLICY_INPUT_SEMANTICS:
+                for index in MAP_INVARIANT_WORLD_STATE_INDICES:
+                    if index < policy_world_state.shape[0]:
+                        policy_world_state[index] = 0.0
+            parts = [policy_world_state, base[:3], context_values]
+            if self.policy_input_semantics in (
+                "world_state_plus_simlingo_temporal_context_v4",
+                MAP_INVARIANT_POLICY_INPUT_SEMANTICS,
+            ):
+                previous = self.previous_rl_policy_action
+                if previous is None or np.asarray(previous).reshape(-1).shape[0] < 4:
+                    previous = np.asarray([base[0], base[1], base[2], 0.0], dtype=np.float32)
+                else:
+                    previous = np.asarray(previous, dtype=np.float32).reshape(-1)[:4]
+                parts.append(previous)
+            state_np = np.concatenate(parts)
+        return state_np
+
+    def _state_for_policy(
+        self,
+        state: np.ndarray,
+        base_action: np.ndarray,
+        context: Dict[str, float],
+    ) -> Tuple[torch.Tensor, np.ndarray]:
+        state_np = self._policy_observation(state, base_action, context)
+        if state_np.shape[0] < self.policy_state_dim:
+            state_np = np.pad(state_np, (0, self.policy_state_dim - state_np.shape[0]), mode="constant")
+        elif state_np.shape[0] > self.policy_state_dim:
+            state_np = state_np[:self.policy_state_dim]
+        state_t = torch.as_tensor(state_np[None, :], dtype=torch.float32, device=self.device)
+        normalized = (state_t - self.policy_state_mean.reshape(1, -1)) / self.policy_state_std.reshape(1, -1)
+        return normalized, state_np
+
+    def _policy_to_control_action(self, base_action: np.ndarray, policy_action: np.ndarray) -> np.ndarray:
+        base = np.asarray(base_action, dtype=np.float32).reshape(-1)
+        action = np.asarray(policy_action, dtype=np.float32).reshape(-1)
+        if action.shape[0] < 4:
+            action = np.pad(action, (0, 4 - action.shape[0]), mode="constant")
+
+        intervention = _clip(float(action[3]), 0.0, 1.0)
+        if self.config.rl_action_space == "absolute":
+            target = np.asarray([
+                _clip(float(action[0]), -1.0, 1.0),
+                _clip(float(action[1]), 0.0, 1.0),
+                _clip(float(action[2]), 0.0, 1.0),
+            ], dtype=np.float32)
+        else:
+            # SimLingo always supplies the base command. The actor learns both
+            # a residual target and how strongly to blend that target. There is
+            # deliberately no scene-dependent veto, recovery rule, or shield.
+            target = np.asarray([
+                _clip(float(base[0]) + float(action[0]) * self.config.rl_steer_scale, -1.0, 1.0),
+                _clip(
+                    float(base[1]) + (float(action[1]) - 0.5) * 2.0 * self.config.rl_throttle_delta,
+                    0.0,
+                    1.0,
+                ),
+                _clip(
+                    float(base[2]) + (float(action[2]) - 0.5) * 2.0 * self.config.rl_brake_delta,
+                    0.0,
+                    1.0,
+                ),
+            ], dtype=np.float32)
+
+        if getattr(self, "policy_action_semantics", "") == (
+            "simlingo_signed_longitudinal_target_with_learned_gate_v3"
+        ):
+            # Blend one signed longitudinal command, not independent throttle
+            # and brake channels. This keeps the learned complement continuous
+            # while making contradictory pedals impossible by construction.
+            base_longitudinal = float(base[1]) - float(base[2])
+            target_longitudinal = float(target[1]) - float(target[2])
+            longitudinal = base_longitudinal + intervention * (
+                target_longitudinal - base_longitudinal
+            )
+            blended = np.asarray([
+                float(base[0]) + intervention * (float(target[0]) - float(base[0])),
+                max(0.0, longitudinal),
+                max(0.0, -longitudinal),
+            ], dtype=np.float32)
+        else:
+            blended = base[:3] + intervention * (target - base[:3])
+        blended[0] = _clip(float(blended[0]), -1.0, 1.0)
+        blended[1] = _clip(float(blended[1]), 0.0, 1.0)
+        blended[2] = _clip(float(blended[2]), 0.0, 1.0)
+        return np.asarray([blended[0], blended[1], blended[2], intervention], dtype=np.float32)
+
+    @torch.no_grad()
+    def rl_policy_action(
+        self,
+        state: np.ndarray,
+        base_action: np.ndarray,
+        context: Dict[str, float],
+    ) -> Optional[Dict[str, Any]]:
+        if self.policy is None:
+            return None
+        previous_policy_action = self.previous_rl_policy_action
+        if previous_policy_action is None:
+            base = np.asarray(base_action, dtype=np.float32).reshape(-1)
+            previous_policy_action = np.asarray(
+                [base[0], base[1], base[2], 0.0], dtype=np.float32
+            )
+        else:
+            previous_policy_action = np.asarray(
+                previous_policy_action, dtype=np.float32
+            ).reshape(-1)[:4].copy()
+        state_t, policy_observation = self._state_for_policy(state, base_action, context)
+        deterministic = (not self.config.rl_training) and self.config.rl_deterministic_eval
+        bounded, log_prob, value, raw = self.policy.act(state_t, deterministic=deterministic)
+        raw_action = raw.reshape(-1).detach().float().cpu().numpy().astype(np.float32)
+        if self.policy_action_semantics == "simlingo_signed_longitudinal_target_with_learned_gate_v3":
+            signed_longitudinal = math.tanh(float(raw_action[1]) - float(raw_action[2]))
+            policy_action = np.asarray([
+                math.tanh(float(raw_action[0])),
+                max(0.0, signed_longitudinal),
+                max(0.0, -signed_longitudinal),
+                1.0 / (1.0 + math.exp(-float(raw_action[3]))),
+            ], dtype=np.float32)
+        else:
+            policy_action = bounded.reshape(-1).detach().float().cpu().numpy().astype(np.float32)
+        control_action = self._policy_to_control_action(base_action, policy_action)
+        self.previous_rl_policy_action = policy_action.copy()
+        return {
+            "action": control_action,
+            "policy_action": policy_action,
+            "raw_action": raw_action,
+            "intervention_strength": float(_clip(policy_action[3], 0.0, 1.0)),
+            "log_prob": float(log_prob.reshape(-1)[0].detach().float().cpu()),
+            "value": float(value.reshape(-1)[0].detach().float().cpu()),
+            "deterministic": bool(deterministic),
+            "policy_observation": policy_observation,
+            "previous_policy_action": previous_policy_action,
+        }
+
     def candidate_actions(self, base: np.ndarray, context: Dict[str, float]) -> List[np.ndarray]:
         steer, throttle, brake, _ = [float(x) for x in base]
         hazard = (
@@ -925,7 +1295,7 @@ class DreamerGuard:
 
         recovery_active = self._recovery_active_context(context)
         recovery_finish = self._recovery_finish_context(context)
-        if self._recovery_context(base, context) or recovery_active or recovery_finish:
+        if self.config.recovery_enabled and (self._recovery_context(base, context) or recovery_active or recovery_finish):
             if self.config.recovery_use_base_throttle:
                 recovery_throttle = max(throttle, self.config.recovery_throttle)
             else:
@@ -1069,7 +1439,7 @@ class DreamerGuard:
 
     def choose(self, scored: List[Dict[str, Any]], context: Dict[str, float]) -> Tuple[Dict[str, Any], bool]:
         base = scored[0]
-        if self.config.mode == "full":
+        if self.config.mode in ("full", "rl_noguard"):
             chosen = max(scored, key=lambda row: row["score"])
             return chosen, int(chosen["candidate_index"]) != 0
 
@@ -1174,7 +1544,7 @@ class DreamerGuard:
             float(control.steer),
             float(control.throttle),
             float(control.brake),
-            0.0 if float(control.brake) > 0.5 else 1.0,
+            0.0 if self.config.mode == "rl_noguard" else (0.0 if float(control.brake) > 0.5 else 1.0),
         ], dtype=np.float32)
         state, context = self.build_state(agent, tick_data)
         if self.recovery_commit_ticks > 0:
@@ -1215,18 +1585,138 @@ class DreamerGuard:
                 ):
                     self.recovery_side = 0
         self._update_blocked_ticks(base_action, context)
+        if self.config.mode == "rl_noguard" and self.policy is not None:
+            policy_row = self.rl_policy_action(state, base_action, context)
+            if policy_row is None:
+                return control, {"enabled": False, "mode": "rl_noguard", "variant": self.config.variant}
+            chosen_action = policy_row["action"]
+            scored = self.predict(state, [base_action, chosen_action])
+            base_score = scored[0]
+            chosen_score = scored[1] if len(scored) > 1 else scored[0]
+            intervention = float(policy_row["intervention_strength"])
+            control_delta = float(np.max(np.abs(chosen_action[:3] - base_action[:3])))
+            has_control_delta = control_delta > 1e-6
+            # This threshold affects display/logging only. The continuous blend
+            # above is always passed through exactly as produced by the policy.
+            applied = bool(intervention >= 0.05 and control_delta >= 0.005)
+            info = {
+                "enabled": True,
+                "mode": self.config.mode,
+                "variant": self.config.variant,
+                "would_override": applied,
+                "applied": applied,
+                "candidate_index": -1,
+                "base_risk": float(base_score["risk"]),
+                "chosen_risk": float(chosen_score["risk"]),
+                "base_progress": float(base_score["progress"]),
+                "chosen_progress": float(chosen_score["progress"]),
+                "chosen_kind": "rl_learned_complement"
+                if self.config.rl_action_space != "absolute"
+                else "rl_learned_absolute_complement",
+                "chosen_side": -1 if float(chosen_action[0]) < float(base_action[0]) - 0.04 else (1 if float(chosen_action[0]) > float(base_action[0]) + 0.04 else 0),
+                "blocked_ticks": int(context.get("blocked_ticks", 0.0)),
+                "recovery_active_ticks": 0,
+                "recovery_commit_ticks": 0,
+                "recovery_finish_active_ticks": 0,
+                "recovery_side": 0,
+                "front_vehicle_m": float(context.get("front_vehicle_m", 80.0)),
+                "nearest_walker_m": float(context.get("nearest_walker_m", 80.0)),
+                "nearest_bike_m": float(context.get("nearest_bike_m", 80.0)),
+                "left_front_m": float(context.get("left_front_m", 80.0)),
+                "left_rear_m": float(context.get("left_rear_m", 80.0)),
+                "right_front_m": float(context.get("right_front_m", 80.0)),
+                "right_rear_m": float(context.get("right_rear_m", 80.0)),
+                "left_clear_m": float(context.get("left_clear_m", 80.0)),
+                "right_clear_m": float(context.get("right_clear_m", 80.0)),
+                "left_ttc_s": float(context.get("left_ttc_s", 99.0)),
+                "right_ttc_s": float(context.get("right_ttc_s", 99.0)),
+                "left_oncoming_m": float(context.get("left_oncoming_m", 80.0)),
+                "right_oncoming_m": float(context.get("right_oncoming_m", 80.0)),
+                "left_oncoming_ttc_s": float(context.get("left_oncoming_ttc_s", 99.0)),
+                "right_oncoming_ttc_s": float(context.get("right_oncoming_ttc_s", 99.0)),
+                "left_lane_available": bool(float(context.get("left_lane_available", 1.0)) >= 0.5),
+                "right_lane_available": bool(float(context.get("right_lane_available", 1.0)) >= 0.5),
+                "traffic_light": context.get("traffic_light", "none"),
+                "collision_shield_active": False,
+                "collision_shield_reason": "",
+                "safe_recovery_sides": [],
+                "gap_recovery_sides": [],
+                "state_vector": state.astype(np.float32).tolist(),
+                "policy_state_vector": policy_row["policy_observation"].astype(np.float32).tolist(),
+                "rl_policy_action": policy_row["policy_action"].astype(np.float32).tolist(),
+                "rl_previous_policy_action": policy_row["previous_policy_action"].astype(np.float32).tolist(),
+                "rl_raw_action": policy_row["raw_action"].astype(np.float32).tolist(),
+                "rl_log_prob": float(policy_row["log_prob"]),
+                "rl_value": float(policy_row["value"]),
+                "rl_deterministic": bool(policy_row["deterministic"]),
+                "rl_action_space": self.config.rl_action_space,
+                "rl_action_semantics": self.policy_action_semantics,
+                "rl_policy_input_semantics": self.policy_input_semantics,
+                "rl_intervention_strength": intervention,
+                "rl_control_delta": control_delta,
+                "simlingo_weight": 1.0 - intervention,
+                "dreamer_weight": intervention,
+                "no_guard": True,
+            }
+            should_log = applied or (
+                getattr(agent, "step", 0) > 0
+                and getattr(agent, "step", 0) % self.config.log_every == 0
+                and time.time() - self.last_log_time > 0.5
+            )
+            if should_log:
+                self.last_log_time = time.time()
+                print(
+                    "SIMLINGO_DREAMER_RL_NOGUARD "
+                    f"step={getattr(agent, 'step', -1)} variant={self.config.variant} "
+                    f"candidate=policy applied={int(applied)} "
+                    f"risk={info['base_risk']:.3f}->{info['chosen_risk']:.3f} "
+                    f"progress={info['base_progress']:.4f}->{info['chosen_progress']:.4f} "
+                    f"kind={info['chosen_kind']} blocked={info['blocked_ticks']} "
+                    f"mix=simlingo:{info['simlingo_weight']:.2f}/dreamer:{info['dreamer_weight']:.2f} "
+                    f"front={info['front_vehicle_m']:.1f} "
+                    f"Lf/R={info['left_front_m']:.1f}/{info['left_rear_m']:.1f} "
+                    f"Rf/R={info['right_front_m']:.1f}/{info['right_rear_m']:.1f} "
+                    f"onL={info['left_oncoming_m']:.1f}/{info['left_oncoming_ttc_s']:.1f} "
+                    f"onR={info['right_oncoming_m']:.1f}/{info['right_oncoming_ttc_s']:.1f} "
+                    f"S {float(base_action[0]):+.2f}->{float(chosen_action[0]):+.2f} "
+                    f"T {float(base_action[1]):.2f}->{float(chosen_action[1]):.2f} "
+                    f"B {float(base_action[2]):.2f}->{float(chosen_action[2]):.2f}",
+                    flush=True,
+                )
+            if self.config.status_path:
+                self.write_status(info, base_action, chosen_action)
+            if not has_control_delta:
+                return control, info
+            action = chosen_action
+            new_control = type(control)(
+                steer=float(action[0]),
+                throttle=float(action[1]),
+                brake=float(action[2]),
+            )
+            for attr in ("hand_brake", "reverse", "manual_gear_shift", "gear"):
+                if hasattr(control, attr) and hasattr(new_control, attr):
+                    try:
+                        setattr(new_control, attr, getattr(control, attr))
+                    except Exception:
+                        pass
+            return new_control, info
+
         candidates = self.candidate_actions(base_action, context)
         scored = self.predict(state, candidates)
         shield_row = (
             None
-            if (self._recovery_commit_context(context) or self._recovery_finish_context(context))
+            if (
+                self.config.mode == "rl_noguard"
+                or self._recovery_commit_context(context)
+                or self._recovery_finish_context(context)
+            )
             else self._collision_shield_row(base_action, scored, context)
         )
         if shield_row is not None:
             chosen, would_override = shield_row, True
         else:
             chosen, would_override = self.choose(scored, context)
-        applied = bool(would_override and self.config.mode in ("apply", "full"))
+        applied = bool(would_override and self.config.mode in ("apply", "full", "rl_noguard"))
 
         info = {
             "enabled": True,
@@ -1247,6 +1737,12 @@ class DreamerGuard:
             "recovery_finish_active_ticks": int(self.recovery_finish_active_ticks),
             "recovery_side": int(self.recovery_side),
             "front_vehicle_m": float(context.get("front_vehicle_m", 80.0)),
+            "nearest_walker_m": float(context.get("nearest_walker_m", 80.0)),
+            "nearest_bike_m": float(context.get("nearest_bike_m", 80.0)),
+            "left_front_m": float(context.get("left_front_m", 80.0)),
+            "left_rear_m": float(context.get("left_rear_m", 80.0)),
+            "right_front_m": float(context.get("right_front_m", 80.0)),
+            "right_rear_m": float(context.get("right_rear_m", 80.0)),
             "left_clear_m": float(context.get("left_clear_m", 80.0)),
             "right_clear_m": float(context.get("right_clear_m", 80.0)),
             "left_ttc_s": float(context.get("left_ttc_s", 99.0)),
@@ -1273,7 +1769,8 @@ class DreamerGuard:
         if should_log:
             self.last_log_time = time.time()
             print(
-                "SIMLINGO_DREAMER_GUARD "
+                ("SIMLINGO_DREAMER_RL_NOGUARD " if self.config.mode == "rl_noguard" else "SIMLINGO_DREAMER_GUARD ")
+                +
                 f"step={getattr(agent, 'step', -1)} variant={self.config.variant} mode={self.config.mode} "
                 f"candidate={info['candidate_index']} applied={int(applied)} "
                 f"risk={info['base_risk']:.3f}->{info['chosen_risk']:.3f} "
@@ -1342,6 +1839,12 @@ class DreamerGuard:
                 "recovery_finish_active_ticks": int(info.get("recovery_finish_active_ticks", 0)),
                 "recovery_side": int(info.get("recovery_side", 0)),
                 "front_vehicle_m": float(info.get("front_vehicle_m", 80.0)),
+                "nearest_walker_m": float(info.get("nearest_walker_m", 80.0)),
+                "nearest_bike_m": float(info.get("nearest_bike_m", 80.0)),
+                "left_front_m": float(info.get("left_front_m", 80.0)),
+                "left_rear_m": float(info.get("left_rear_m", 80.0)),
+                "right_front_m": float(info.get("right_front_m", 80.0)),
+                "right_rear_m": float(info.get("right_rear_m", 80.0)),
                 "left_clear_m": float(info.get("left_clear_m", 80.0)),
                 "right_clear_m": float(info.get("right_clear_m", 80.0)),
                 "left_ttc_s": float(info.get("left_ttc_s", 99.0)),
@@ -1359,15 +1862,29 @@ class DreamerGuard:
                 "gap_recovery_sides": list(info.get("gap_recovery_sides", [])),
                 "state_dim": int(self.state_dim),
                 "state_vector": list(info.get("state_vector", [])),
+                "rl_policy_action": list(info.get("rl_policy_action", [])),
+                "rl_raw_action": list(info.get("rl_raw_action", [])),
+                "rl_log_prob": float(info.get("rl_log_prob", 0.0)),
+                "rl_value": float(info.get("rl_value", 0.0)),
+                "rl_deterministic": bool(info.get("rl_deterministic", False)),
+                "rl_action_space": str(info.get("rl_action_space", "")),
+                "rl_action_semantics": str(info.get("rl_action_semantics", "")),
+                "rl_intervention_strength": float(info.get("rl_intervention_strength", 0.0)),
+                "rl_control_delta": float(info.get("rl_control_delta", 0.0)),
+                "simlingo_weight": float(info.get("simlingo_weight", 1.0)),
+                "dreamer_weight": float(info.get("dreamer_weight", 0.0)),
+                "no_guard": bool(info.get("no_guard", False)),
                 "base_action": {
                     "steer": float(base_action[0]),
                     "throttle": float(base_action[1]),
                     "brake": float(base_action[2]),
+                    "intervention": 0.0,
                 },
                 "chosen_action": {
                     "steer": float(chosen_action[0]),
                     "throttle": float(chosen_action[1]),
                     "brake": float(chosen_action[2]),
+                    "intervention": float(info.get("rl_intervention_strength", chosen_action[3] if len(chosen_action) > 3 else 0.0)),
                 },
             }
             with tempfile.NamedTemporaryFile("w", dir=str(path.parent), delete=False, encoding="utf-8") as tmp:

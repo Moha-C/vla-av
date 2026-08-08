@@ -9,7 +9,7 @@ if [[ -n "${DREAMER_RL_CAMPAIGN_RUN_DIR:-}" ]]; then
 elif [[ -s "$LATEST_FILE" ]]; then
   RUN_DIR="$(cat "$LATEST_FILE")"
 else
-  echo "[dreamer-rl-campaign-watch] no campaign has been launched yet"
+  echo "[dreamer-complement-campaign-watch] no campaign has been launched yet"
   exit 1
 fi
 
@@ -30,7 +30,7 @@ else
   STATE="STOPPED"
 fi
 
-echo "=== Dreamer RL Autonomous Campaign ==="
+echo "=== Dreamer Complement Campaign ==="
 echo "run_dir:  $RUN_DIR"
 echo "state:    $STATE"
 echo
@@ -47,9 +47,12 @@ if cur:
     print(f"current:  route {cur.get('route_id')} {cur.get('town')} {cur.get('scenario_type')} seed={cur.get('seed')}")
 if data.get("dataset"):
     print(f"dataset:  {data['dataset'].get('path')}")
+if data.get("complement_checkpoints"):
+    for kind, info in data["complement_checkpoints"].items():
+        print(f"comp {kind}: {info.get('status')} {info.get('checkpoint', '')}")
 if data.get("warmstarts"):
     for kind, info in data["warmstarts"].items():
-        print(f"warm {kind}: {info.get('status')} {info.get('checkpoint', '')}")
+        print(f"legacy warm {kind}: {info.get('status')} {info.get('checkpoint', '')}")
 if data.get("rl_runs"):
     for kind, info in data["rl_runs"].items():
         print(f"rl {kind}: {info.get('status')} {info.get('run_dir', '')}")

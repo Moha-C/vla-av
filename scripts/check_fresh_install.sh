@@ -80,8 +80,8 @@ exists_exec "$CARLA_ROOT/CarlaUE4.sh" "CARLA executable"
 exists_file "$ROOT_DIR/models/simlingo_hf/simlingo/checkpoints/epoch=013.ckpt/pytorch_model.pt" "SimLingo model"
 exists_file "$ROOT_DIR/external/simlingo/checkpoints/dreamer_guard/best_world_model.pt" "Dreamer PPO guarded checkpoint"
 exists_file "$ROOT_DIR/external/simlingo/checkpoints/dreamer_sdbs_fresh/best_world_model.pt" "Dreamer SDBS guarded checkpoint"
-exists_file "$ROOT_DIR/external/simlingo/checkpoints/dreamer_ppo_rl_noguard/latest_rl_model.pt" "Dreamer PPO RL no-guard checkpoint"
-exists_file "$ROOT_DIR/external/simlingo/checkpoints/dreamer_sdbs_rl_noguard/latest_rl_model.pt" "Dreamer SDBS RL no-guard checkpoint"
+exists_file "$ROOT_DIR/external/simlingo/checkpoints/dreamer_ppo_complement/latest_world_model.pt" "Dreamer PPO complement checkpoint"
+exists_file "$ROOT_DIR/external/simlingo/checkpoints/dreamer_sdbs_complement/latest_world_model.pt" "Dreamer SDBS complement checkpoint"
 
 if conda env list | awk '{print $1}' | grep -qx "$CONDA_ENV"; then
   ok "conda env exists: $CONDA_ENV"

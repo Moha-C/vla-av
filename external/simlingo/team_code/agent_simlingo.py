@@ -182,12 +182,14 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         self.draw_waypoints = os.environ.get("SIMLINGO_DRAW_WAYPOINTS", "1").lower() not in ("0", "false", "no")
         self.dreamer_guard = None
         self.last_dreamer_guard_info = {}
-        if os.environ.get("SIMLINGO_DREAMER_GUARD", "0").lower() not in ("", "0", "false", "no", "off"):
+        dreamer_runtime = os.environ.get("SIMLINGO_DREAMER_RUNTIME", "").lower()
+        dreamer_guard_enabled = os.environ.get("SIMLINGO_DREAMER_GUARD", "0").lower() not in ("", "0", "false", "no", "off")
+        if dreamer_guard_enabled or dreamer_runtime == "rl_noguard":
             try:
                 from team_code.dreamer_guard import DreamerGuard
                 self.dreamer_guard = DreamerGuard.from_env()
             except Exception as exc:
-                print(f"SIMLINGO_DREAMER_GUARD disabled: {exc}", flush=True)
+                print(f"SIMLINGO_DREAMER runtime disabled: {exc}", flush=True)
         self.last_control_debug = {}
         self.image_transform = build_transform(input_size=448)
         self.conv_module = None

@@ -14,8 +14,8 @@ echo "$RUN_DIR" > "$LATEST_FILE"
 if [[ -s "$PID_FILE" ]]; then
   OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
   if [[ -n "$OLD_PID" ]] && ps -p "$OLD_PID" >/dev/null 2>&1; then
-    echo "[dreamer-rl-campaign] already running pid=$OLD_PID"
-    echo "[dreamer-rl-campaign] run_dir=$RUN_DIR"
+    echo "[dreamer-complement-campaign] already running pid=$OLD_PID"
+    echo "[dreamer-complement-campaign] run_dir=$RUN_DIR"
     exit 0
   fi
 fi
@@ -25,7 +25,7 @@ nohup setsid python3 "$ROOT_DIR/scripts/run_dreamer_rl_autonomous_campaign.py" \
   > "$LOG_FILE" 2>&1 &
 echo $! > "$PID_FILE"
 
-echo "[dreamer-rl-campaign] launched"
-echo "[dreamer-rl-campaign] pid=$(cat "$PID_FILE")"
-echo "[dreamer-rl-campaign] run_dir=$RUN_DIR"
-echo "[dreamer-rl-campaign] watch: bash scripts/watch_dreamer_rl_autonomous_campaign.sh"
+echo "[dreamer-complement-campaign] launched"
+echo "[dreamer-complement-campaign] pid=$(cat "$PID_FILE")"
+echo "[dreamer-complement-campaign] run_dir=$RUN_DIR"
+echo "[dreamer-complement-campaign] watch: bash scripts/watch_dreamer_rl_autonomous_campaign.sh"

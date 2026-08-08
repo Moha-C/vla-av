@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Autonomous overnight campaign for SimLingo + Dreamer RL preparation."""
+"""Autonomous campaign for SimLingo + Dreamer complement preparation."""
 
 from __future__ import annotations
 
@@ -125,7 +125,7 @@ def classify_run(metrics: Optional[Dict[str, Any]], exit_code: Optional[int], tr
 
 def render_summary(status: Dict[str, Any], path: Path) -> None:
     lines: List[str] = []
-    lines.append("# Dreamer RL Autonomous Campaign")
+    lines.append("# Dreamer Complement Campaign")
     lines.append("")
     lines.append(f"- run_id: `{status['run_id']}`")
     lines.append(f"- phase: `{status.get('phase', '-')}`")
@@ -161,16 +161,11 @@ def render_summary(status: Dict[str, Any], path: Path) -> None:
         lines.append("## Dataset")
         lines.append(f"- dataset: `{status['dataset'].get('path')}`")
         lines.append(f"- audit: `{status['dataset'].get('audit')}`")
-    if status.get("warmstarts"):
+    if status.get("complement_checkpoints"):
         lines.append("")
-        lines.append("## Warm Starts")
-        for kind, info in status["warmstarts"].items():
+        lines.append("## Complement Checkpoints")
+        for kind, info in status["complement_checkpoints"].items():
             lines.append(f"- {kind}: `{info.get('checkpoint')}`")
-    if status.get("rl_runs"):
-        lines.append("")
-        lines.append("## RL Runs")
-        for kind, info in status["rl_runs"].items():
-            lines.append(f"- {kind}: `{info.get('run_dir')}` status={info.get('status')}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -378,16 +373,22 @@ class Campaign:
             Path(run["trace"]) for run in self.status["runs"]
             if run.get("quality") == "good" and Path(run.get("trace", "")).exists()
         ]
-        fallback_traces = [
+        rejected_traces = [
             Path(run["trace"]) for run in self.status["runs"]
-            if Path(run.get("trace", "")).exists()
+            if run.get("quality") != "good" and Path(run.get("trace", "")).exists()
         ]
-        traces = good_traces if len(good_traces) >= self.args.min_good_traces else fallback_traces
-        if not traces:
+        self.status["accepted_trace_count"] = len(good_traces)
+        self.status["rejected_trace_count"] = len(rejected_traces)
+        if len(good_traces) < self.args.min_good_traces:
             self.status["phase"] = "dataset_failed"
-            self.status["dataset_error"] = "No trace files were collected"
+            self.status["dataset_error"] = (
+                f"Only {len(good_traces)} clean trace(s) passed the safety gate; "
+                f"at least {self.args.min_good_traces} are required. "
+                f"Rejected traces ({len(rejected_traces)}) were not used."
+            )
             self.save()
             return None
+        traces = good_traces
 
         self.status["phase"] = "building_dataset"
         self.status["dataset_trace_count"] = len(traces)
@@ -422,97 +423,42 @@ class Campaign:
         self.save()
         return dataset
 
-    def train_warmstart(self, kind: str, dataset: Path) -> Optional[Path]:
-        self.status["phase"] = f"warmstart_{kind}"
+    def train_complement(self, kind: str, dataset: Path) -> Optional[Path]:
+        self.status["phase"] = f"complement_{kind}"
         self.save()
         env = os.environ.copy()
         env.update({
-            "DREAMER_RL_KIND": kind,
-            "DREAMER_RL_DATASET": str(dataset),
-            "DREAMER_RL_WM_RUN_ID": self.run_id,
-            "DREAMER_RL_WM_EPOCHS": str(self.args.warmstart_epochs),
-            "DREAMER_RL_WM_BATCH_SIZE": str(self.args.warmstart_batch_size),
-            "DREAMER_RL_DEVICE": self.args.device,
-            "DREAMER_RL_SET_AS_INIT": "0",
+            "DREAMER_COMPLEMENT_KIND": kind,
+            "DREAMER_COMPLEMENT_DATASET": str(dataset),
+            "DREAMER_COMPLEMENT_RUN_ID": self.run_id,
+            "DREAMER_COMPLEMENT_EPOCHS": str(self.args.warmstart_epochs),
+            "DREAMER_COMPLEMENT_BATCH_SIZE": str(self.args.warmstart_batch_size),
+            "DREAMER_COMPLEMENT_DEVICE": self.args.device,
+            "DREAMER_COMPLEMENT_INSTALL": "1",
         })
         try:
             subprocess.run(
-                ["bash", str(ROOT / "scripts" / "train_dreamer_rl_world_model_warmstart.sh")],
+                ["bash", str(ROOT / "scripts" / "train_dreamer_complement_from_traces.sh")],
                 cwd=str(ROOT),
                 env=env,
                 check=True,
             )
         except subprocess.CalledProcessError as exc:
-            self.status.setdefault("warmstarts", {})[kind] = {"status": "failed", "error": str(exc)}
+            self.status.setdefault("complement_checkpoints", {})[kind] = {"status": "failed", "error": str(exc)}
             self.save()
             return None
 
-        checkpoint = ROOT / "logs" / "dreamer_rl_warmstart" / kind / self.run_id / "best_world_model.pt"
-        self.status.setdefault("warmstarts", {})[kind] = {
+        if kind == "ppo":
+            checkpoint = ROOT / "external" / "simlingo" / "checkpoints" / "dreamer_ppo_complement" / "latest_world_model.pt"
+        else:
+            checkpoint = ROOT / "external" / "simlingo" / "checkpoints" / "dreamer_sdbs_complement" / "latest_world_model.pt"
+        self.status.setdefault("complement_checkpoints", {})[kind] = {
             "status": "done",
             "checkpoint": str(checkpoint),
+            "objective": "SimLingo-relative complement scorer, not standalone CarlaEnv policy",
         }
         self.save()
         return checkpoint if checkpoint.exists() else None
-
-    def wait_rl_run(self, kind: str, run_id: str, run_dir: Path) -> str:
-        done = run_dir / "training.done"
-        failed = run_dir / "training.failed"
-        pid_file = run_dir / "training.pid"
-        while True:
-            if done.exists():
-                return "done"
-            if failed.exists():
-                return f"failed exit={failed.read_text(encoding='utf-8').strip()}"
-            pid = pid_file.read_text(encoding="utf-8").strip() if pid_file.exists() else ""
-            if pid:
-                alive = subprocess.run(["ps", "-p", pid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-                if not alive:
-                    return "stopped"
-            self.status["phase"] = f"rl_{kind}_running"
-            self.status.setdefault("rl_runs", {}).setdefault(kind, {})
-            self.status["rl_runs"][kind].update({"run_id": run_id, "run_dir": str(run_dir), "status": "running"})
-            self.save()
-            time.sleep(self.args.rl_poll_seconds)
-
-    def train_rl(self, kind: str, warmstart: Path) -> None:
-        self.status["phase"] = f"rl_{kind}_starting"
-        self.save()
-        run_id = f"{self.run_id}_{kind}_rl"
-        env = os.environ.copy()
-        env.update({
-            "DREAMER_RL_KIND": kind,
-            "DREAMER_RL_RUN_ID": run_id,
-            "DREAMER_RL_INIT_WORLD_MODEL": str(warmstart),
-            "DREAMER_RL_EPISODES": str(self.args.rl_episodes),
-            "DREAMER_RL_MAX_EPISODE_STEPS": str(self.args.rl_max_episode_steps),
-            "DREAMER_RL_ROLLOUT_SIZE": str(self.args.rl_rollout_size),
-            "DREAMER_RL_EVAL_INTERVAL": str(self.args.rl_eval_interval),
-            "DREAMER_RL_DEVICE": self.args.device,
-            "DREAMER_RL_INSTALL_LATEST": "1",
-            "RESTART_EXISTING": "1",
-            "CARLA_QUALITY": self.args.carla_quality,
-        })
-        try:
-            subprocess.run(
-                ["bash", str(ROOT / "scripts" / "start_dreamer_rl_noguard_training.sh")],
-                cwd=str(ROOT),
-                env=env,
-                check=True,
-            )
-        except subprocess.CalledProcessError as exc:
-            self.status.setdefault("rl_runs", {})[kind] = {"run_id": run_id, "status": "failed_to_start", "error": str(exc)}
-            self.save()
-            return
-
-        run_dir = ROOT / "logs" / "dreamer_rl_noguard" / kind / run_id
-        status = self.wait_rl_run(kind, run_id, run_dir)
-        self.status.setdefault("rl_runs", {})[kind] = {
-            "run_id": run_id,
-            "run_dir": str(run_dir),
-            "status": status,
-        }
-        self.save()
 
     def run(self) -> None:
         self.event(event="campaign_start", run_id=self.run_id)
@@ -525,21 +471,13 @@ class Campaign:
             self.event(event="campaign_dataset_failed")
             return
 
-        warmstarts: Dict[str, Path] = {}
+        complement_checkpoints: Dict[str, Path] = {}
         for kind in ("ppo", "sdbs"):
-            checkpoint = self.train_warmstart(kind, dataset)
+            checkpoint = self.train_complement(kind, dataset)
             if checkpoint:
-                warmstarts[kind] = checkpoint
+                complement_checkpoints[kind] = checkpoint
 
-        if self.args.skip_live_rl:
-            self.status["phase"] = "done_skip_live_rl"
-            self.save()
-            return
-
-        for kind, checkpoint in warmstarts.items():
-            self.train_rl(kind, checkpoint)
-
-        self.status["phase"] = "done"
+        self.status["phase"] = "done_complement_training"
         self.status["finished_at"] = now()
         self.save()
         self.event(event="campaign_done", run_id=self.run_id)
@@ -566,12 +504,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmstart-epochs", type=int, default=int(os.environ.get("DREAMER_RL_CAMPAIGN_WM_EPOCHS", "80")))
     parser.add_argument("--warmstart-batch-size", type=int, default=int(os.environ.get("DREAMER_RL_CAMPAIGN_WM_BATCH_SIZE", "128")))
     parser.add_argument("--device", default=os.environ.get("DREAMER_RL_DEVICE", "auto"))
-    parser.add_argument("--rl-episodes", type=int, default=int(os.environ.get("DREAMER_RL_CAMPAIGN_RL_EPISODES", "80")))
-    parser.add_argument("--rl-max-episode-steps", type=int, default=int(os.environ.get("DREAMER_RL_CAMPAIGN_RL_MAX_EPISODE_STEPS", "700")))
-    parser.add_argument("--rl-rollout-size", type=int, default=int(os.environ.get("DREAMER_RL_CAMPAIGN_RL_ROLLOUT_SIZE", "1024")))
-    parser.add_argument("--rl-eval-interval", type=int, default=int(os.environ.get("DREAMER_RL_CAMPAIGN_RL_EVAL_INTERVAL", "20")))
-    parser.add_argument("--rl-poll-seconds", type=int, default=int(os.environ.get("DREAMER_RL_CAMPAIGN_RL_POLL_SECONDS", "30")))
-    parser.add_argument("--skip-live-rl", action="store_true", default=os.environ.get("DREAMER_RL_CAMPAIGN_SKIP_LIVE_RL", "0") == "1")
     parser.add_argument("--collect-retries", type=int, default=int(os.environ.get("DREAMER_RL_CAMPAIGN_COLLECT_RETRIES", "1")))
     parser.add_argument("--retry-if-shorter-than", type=float, default=float(os.environ.get("DREAMER_RL_CAMPAIGN_RETRY_IF_SHORTER_THAN", "90")))
     parser.add_argument("--collect-max-wall-seconds", type=float, default=float(os.environ.get("DREAMER_RL_CAMPAIGN_COLLECT_MAX_WALL_SECONDS", "900")))

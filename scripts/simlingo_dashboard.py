@@ -6,6 +6,7 @@ import mimetypes
 import os
 import random
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -45,6 +46,13 @@ STATE = {
     "started_at": None,
     "launch_log": None,
     "last_error": None,
+    "last_exit_code": None,
+    "online_rl_enabled": False,
+    "online_rl_status": None,
+    "online_rl_run_dir": None,
+    "online_rl_trace": None,
+    "online_rl_update": None,
+    "manual_stop_requested": False,
 }
 STATE_LOCK = threading.Lock()
 
@@ -151,7 +159,20 @@ def choose_route(payload):
 def stop_current(kill_carla=False):
     with STATE_LOCK:
         proc = STATE.get("process")
+        run_dir = STATE.get("online_rl_run_dir")
+        if proc is not None and proc.poll() is None:
+            STATE["manual_stop_requested"] = True
         STATE["process"] = None
+    if proc is not None and proc.poll() is None and run_dir:
+        try:
+            run_path = Path(run_dir)
+            run_path.mkdir(parents=True, exist_ok=True)
+            (run_path / "manual_stop.txt").write_text(
+                time.strftime("%Y-%m-%d %H:%M:%S") + "\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
     if proc is not None and proc.poll() is None:
         try:
             os.killpg(proc.pid, signal.SIGTERM)
@@ -183,8 +204,366 @@ def stop_current(kill_carla=False):
             subprocess.run(["pkill", "-9", "-f", pattern], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def expected_stop_exit(exit_code):
+    return exit_code in (None, 0, -signal.SIGINT, -signal.SIGTERM, 130, 143)
+
+
+def latest_result_after(start_time):
+    result_dir = ROOT / "logs" / "simlingo_eval"
+    candidates = [
+        path for path in result_dir.glob("results_*.json")
+        if path.stat().st_mtime >= start_time - 2.0
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def rl_kind_for_dreamer_mode(dreamer_mode):
+    if dreamer_mode == "dreamer_ppo_rl_noguard":
+        return "ppo"
+    if dreamer_mode == "dreamer_sdbs_rl_noguard":
+        return "sdbs"
+    return None
+
+
+def checkpoint_for_rl_kind(kind):
+    if kind == "ppo":
+        return SIMLINGO_ROOT / "checkpoints" / "dreamer_ppo_rl_noguard" / "latest_rl_model.pt"
+    if kind == "sdbs":
+        return SIMLINGO_ROOT / "checkpoints" / "dreamer_sdbs_rl_noguard" / "latest_rl_model.pt"
+    raise ValueError(f"unknown RL kind: {kind}")
+
+
+def trace_rl_rows(path):
+    path = Path(path)
+    if not path.exists():
+        return 0
+    count = 0
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                status = (json.loads(line).get("status") or {})
+            except Exception:
+                continue
+            if status.get("mode") == "rl_noguard":
+                count += 1
+    return count
+
+
+def trace_total_rows(path):
+    path = Path(path)
+    if not path.exists():
+        return 0
+    count = 0
+    with path.open(encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            if line.strip():
+                count += 1
+    return count
+
+
+def write_online_rl_status(run_dir, payload):
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "status.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+    lines = [
+        "# Webapp Online RL No-Guard Run",
+        "",
+        f"- phase: `{payload.get('phase')}`",
+        f"- kind: `{payload.get('kind')}`",
+        f"- route: `{payload.get('route_id')}` / `{payload.get('town')}` / `{payload.get('scenario')}`",
+        f"- seed: `{payload.get('seed')}`",
+        f"- no_guard: `{payload.get('no_guard')}`",
+        f"- complement_to_simlingo: `{payload.get('complement_to_simlingo')}`",
+        f"- trace_rows: `{payload.get('trace_rows', 0)}`",
+        f"- rl_trace_rows: `{payload.get('rl_trace_rows', 0)}`",
+    ]
+    update = payload.get("update") or {}
+    if update:
+        lines.extend([
+            "",
+            "## Update",
+            f"- status: `{update.get('status')}`",
+            f"- reward_sum: `{update.get('reward_sum')}`",
+            f"- transitions: `{update.get('transitions')}`",
+            f"- policy_loss: `{update.get('policy_loss')}`",
+            f"- world_model_loss: `{update.get('world_model_loss')}`",
+        ])
+    (run_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def start_online_rl_collector(env, run_dir, trace_path, route, seed):
+    collector_log = run_dir / "collector.log"
+    collector_log.parent.mkdir(parents=True, exist_ok=True)
+    collector_fh = collector_log.open("w", buffering=1, encoding="utf-8")
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-u",
+            str(ROOT / "scripts" / "action_dreaming_collect_normal.py"),
+            "--status-path",
+            env["SIMLINGO_DREAMER_STATUS_PATH"],
+            "--output",
+            str(trace_path),
+            "--interval",
+            str(env.get("ACTION_DREAMING_SAMPLE_INTERVAL", "0.10")),
+            "--route-id",
+            route["id"],
+            "--route-file",
+            route["file"],
+            "--town",
+            route["town"],
+            "--seed",
+            str(seed),
+        ],
+        cwd=str(ROOT),
+        env=env,
+        stdout=collector_fh,
+        stderr=subprocess.STDOUT,
+        preexec_fn=os.setsid,
+    )
+    collector_fh.close()
+    return proc, collector_log
+
+
+def stop_online_rl_collector(proc):
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+
+def monitor_online_rl_blocked_episode(proc, meta, status_path):
+    """End a training episode that is irrecoverably stationary.
+
+    This is an episode-boundary rule only: it never changes steer, throttle,
+    brake, policy output, or SimLingo output. The resulting blocked episode is
+    still sent to PPO as a failed experience.
+    """
+    if not meta:
+        return
+    threshold = max(
+        0,
+        int(os.environ.get("DREAMER_ONLINE_RL_BLOCKED_TRUNCATE_TICKS", "800")),
+    )
+    if threshold <= 0:
+        return
+    status_path = Path(status_path)
+    while proc.poll() is None:
+        time.sleep(0.5)
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            continue
+        if status.get("mode") != "rl_noguard":
+            continue
+        timestamp = float(status.get("timestamp", 0.0) or 0.0)
+        if timestamp <= 0.0 or time.time() - timestamp > 5.0:
+            continue
+        blocked_ticks = int(float(status.get("blocked_ticks", 0) or 0))
+        if blocked_ticks < threshold:
+            continue
+        run_dir = Path(meta["run_dir"])
+        marker = {
+            "reason": "blocked_training_episode",
+            "blocked_ticks": blocked_ticks,
+            "threshold": threshold,
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "checkpoint_update_requested": True,
+            "driving_guard_used": False,
+        }
+        (run_dir / "auto_truncate.json").write_text(
+            json.dumps(marker, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        with STATE_LOCK:
+            if STATE.get("process") is proc:
+                STATE["online_rl_status"] = "truncating_blocked_episode"
+                STATE["online_rl_update"] = marker
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        return
+
+
+def run_online_rl_update(meta, exit_code):
+    run_dir = Path(meta["run_dir"])
+    trace_path = Path(meta["trace_path"])
+    kind = meta["kind"]
+    checkpoint = checkpoint_for_rl_kind(kind)
+    result_path = latest_result_after(meta["started_at"])
+    metrics = parse_bench2drive_result(result_path) if result_path else None
+    manual_stop = bool(meta.get("manual_stop"))
+    if manual_stop or metrics is None:
+        metrics = {
+            "path": str(result_path) if result_path else "",
+            "status": "manual_stop_incomplete" if manual_stop else "incomplete_or_ineligible",
+            "incomplete": 1.0,
+            "route_score": 0.0,
+            "driving_score": 0.0,
+            "penalty": 0.0,
+            "collisions": 1.0 if manual_stop or not expected_stop_exit(exit_code) else 0.0,
+            "pedestrian_collisions": 0.0,
+            "vehicle_collisions": 1.0 if manual_stop or not expected_stop_exit(exit_code) else 0.0,
+            "layout_collisions": 0.0,
+            "red_lights": 0.0,
+            "stop_infractions": 0.0,
+            "offroad": 1.0 if manual_stop or not expected_stop_exit(exit_code) else 0.0,
+            "blocked": 1.0,
+            "scenario_timeouts": 0.0,
+            "route_timeouts": 0.0,
+            "min_speed_infractions": 0.0,
+            "success": 0.0,
+        }
+    rl_rows = trace_rl_rows(trace_path)
+    summary_path = run_dir / "update_summary.json"
+    payload = {
+        **meta,
+        "phase": "updating_checkpoint",
+        "exit_code": exit_code,
+        "result": str(result_path) if result_path else None,
+        "metrics": metrics or {},
+        "trace_rows": trace_total_rows(trace_path),
+        "rl_trace_rows": rl_rows,
+        "update": {"status": "pending"},
+    }
+    write_online_rl_status(run_dir, payload)
+    with STATE_LOCK:
+        STATE["online_rl_status"] = "updating_checkpoint"
+        STATE["online_rl_update"] = {"status": "pending", "run_dir": str(run_dir)}
+
+    cmd = [
+        "conda",
+        "run",
+        "-n",
+        os.environ.get("DREAMER_ONLINE_RL_CONDA_ENV", "simlingo"),
+        "python",
+        str(ROOT / "scripts" / "dreamer_online_rl_update.py"),
+        "--trace",
+        str(trace_path),
+        "--checkpoint",
+        str(checkpoint),
+        "--output-checkpoint",
+        str(checkpoint),
+        "--metrics-json",
+        json.dumps(metrics or {}),
+        "--summary",
+        str(summary_path),
+        "--device",
+        os.environ.get("DREAMER_ONLINE_RL_DEVICE", "auto"),
+        "--epochs",
+        os.environ.get("DREAMER_ONLINE_RL_UPDATE_EPOCHS", "4"),
+        "--batch-size",
+        os.environ.get("DREAMER_ONLINE_RL_BATCH_SIZE", "128"),
+        "--min-transitions",
+        os.environ.get("DREAMER_ONLINE_RL_MIN_TRANSITIONS", "64"),
+        "--min-save-reward-sum",
+        os.environ.get("DREAMER_ONLINE_RL_MIN_SAVE_REWARD_SUM", "-250"),
+        "--max-save-unsafe-side-loss",
+        os.environ.get("DREAMER_ONLINE_RL_MAX_SAVE_UNSAFE_SIDE_LOSS", "-100"),
+        "--max-save-stuck-loss",
+        os.environ.get("DREAMER_ONLINE_RL_MAX_SAVE_STUCK_LOSS", "-60"),
+        "--learn-from-failures",
+    ]
+    proc = subprocess.run(cmd, cwd=str(ROOT), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    update = {
+        "status": "failed" if proc.returncode not in (0, 2) else ("skipped" if proc.returncode == 2 else "updated"),
+        "returncode": proc.returncode,
+        "stdout_tail": proc.stdout[-4000:],
+        "summary": str(summary_path),
+    }
+    if summary_path.exists():
+        try:
+            update.update(json.loads(summary_path.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    payload["phase"] = "done"
+    payload["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    payload["update"] = update
+    write_online_rl_status(run_dir, payload)
+    with STATE_LOCK:
+        STATE["online_rl_status"] = "done"
+        STATE["online_rl_update"] = update
+    return update
+
+
+def monitor_run_completion(proc, collector_proc, meta):
+    exit_code = proc.wait()
+    stop_online_rl_collector(collector_proc)
+    with STATE_LOCK:
+        if STATE.get("process") is proc:
+            STATE["last_exit_code"] = exit_code
+            if not expected_stop_exit(exit_code):
+                STATE["last_error"] = (
+                    f"Simulation exited with code {exit_code}. "
+                    f"Launch log: {STATE.get('launch_log') or 'unavailable'}"
+                )
+    if not meta:
+        return
+    run_dir = Path(meta["run_dir"])
+    if (run_dir / "manual_stop.txt").exists():
+        update_on_stop = os.environ.get("DREAMER_ONLINE_RL_UPDATE_ON_MANUAL_STOP", "0").lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        if update_on_stop and trace_rl_rows(Path(meta["trace_path"])) >= int(os.environ.get("DREAMER_ONLINE_RL_MIN_TRANSITIONS", "64")):
+            meta = {**meta, "manual_stop": True}
+        else:
+            update = {
+                "status": "skipped",
+                "reason": "manual stop requested; checkpoint not updated",
+                "run_dir": str(run_dir),
+                "checkpoint_saved": False,
+            }
+            payload = {
+                **meta,
+                "phase": "aborted_manual_stop",
+                "exit_code": exit_code,
+                "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "update": update,
+                "no_guard": True,
+                "complement_to_simlingo": True,
+            }
+            write_online_rl_status(run_dir, payload)
+            with STATE_LOCK:
+                STATE["online_rl_status"] = "done"
+                STATE["online_rl_update"] = update
+            return
+    try:
+        run_online_rl_update(meta, exit_code)
+    except Exception as exc:
+        run_dir = Path(meta["run_dir"])
+        payload = {
+            **meta,
+            "phase": "failed",
+            "error": str(exc),
+            "exit_code": exit_code,
+            "no_guard": True,
+            "complement_to_simlingo": True,
+        }
+        write_online_rl_status(run_dir, payload)
+        with STATE_LOCK:
+            STATE["online_rl_status"] = "failed"
+            STATE["online_rl_update"] = {"status": "failed", "error": str(exc), "run_dir": str(run_dir)}
+
+
 def start_run(payload):
     stop_current(kill_carla=True)
+    with STATE_LOCK:
+        STATE["manual_stop_requested"] = False
     route = choose_route(payload)
     seed = int(payload.get("seed") or random.randint(1, 999999))
     port = int(payload.get("port") or 2000)
@@ -242,6 +621,17 @@ def start_run(payload):
         "SIMLINGO_VLM_COT_LOG_PATH": str(ROOT / "logs" / "simlingo_eval" / "vlm_cot_reasoning.jsonl"),
         "SUMO_HOME": os.environ.get("SUMO_HOME", "/usr/share/sumo"),
     })
+    for live_status_key in (
+        "SIMLINGO_DREAMER_STATUS_PATH",
+        "SIMLINGO_VLM_COT_STATUS_PATH",
+        "SIMLINGO_VLM_COT_FRAME_PATH",
+    ):
+        try:
+            Path(env[live_status_key]).unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
     if cot_mode in ("qwen2_vl", "auto"):
         env["SIMLINGO_VLM_COT_LOCAL_ONLY"] = str(payload.get("cot_local_only") or "1")
     dreamer_presets = {
@@ -379,19 +769,18 @@ def start_run(payload):
         "SIMLINGO_DREAMER_VARIANT": "dreamer_sdbs_unified",
     }
     dreamer_presets["dreamer_ppo_rl_noguard"] = {
-        "SIMLINGO_DREAMER_GUARD": "1",
-        "SIMLINGO_DREAMER_GUARD_MODE": "full",
+        "SIMLINGO_DREAMER_GUARD": "0",
+        "SIMLINGO_DREAMER_RUNTIME": "rl_noguard",
+        "SIMLINGO_DREAMER_GUARD_MODE": "rl_noguard",
         "SIMLINGO_DREAMER_VARIANT": "dreamer_ppo_rl_noguard",
         "SIMLINGO_DREAMER_RISK_MARGIN": "0.0",
-        "SIMLINGO_DREAMER_MAX_PROGRESS_DROP": "1.0",
-        "SIMLINGO_DREAMER_MAX_STEER_DELTA": "1.0",
-        "SIMLINGO_DREAMER_MAX_BRAKE_INCREASE": "1.0",
-        "SIMLINGO_DREAMER_HAZARD_FRONT_M": "26.0",
-        "SIMLINGO_DREAMER_W_PROGRESS": "1.05",
-        "SIMLINGO_DREAMER_W_RISK": "2.0",
-        "SIMLINGO_DREAMER_ACTION_PENALTY": "0.065",
-        "SIMLINGO_DREAMER_RECOVERY": "0",
+        "SIMLINGO_DREAMER_MAX_PROGRESS_DROP": "999.0",
         "SIMLINGO_DREAMER_COLLISION_SHIELD": "0",
+        "SIMLINGO_DREAMER_RECOVERY": "0",
+        "SIMLINGO_DREAMER_RL_ACTION_SPACE": "absolute",
+        "SIMLINGO_DREAMER_RL_CONTINUE_THROTTLE": "0.00",
+        "SIMLINGO_DREAMER_RL_POLICY_INPUT_NORM": "fixed",
+        "SIMLINGO_DREAMER_RL_ACTION_SEMANTICS": "simlingo_target_control_with_learned_gate_v2",
     }
     dreamer_presets["dreamer_sdbs_rl_noguard"] = {
         **dreamer_presets["dreamer_ppo_rl_noguard"],
@@ -408,6 +797,11 @@ def start_run(payload):
     dreamer_mode = dreamer_aliases.get(dreamer_mode, dreamer_mode)
     if dreamer_mode in dreamer_presets:
         env.update(dreamer_presets[dreamer_mode])
+        if payload.get("dreamer_rl_training"):
+            env["SIMLINGO_DREAMER_RL_TRAINING"] = "1"
+            env["SIMLINGO_DREAMER_RL_DETERMINISTIC_EVAL"] = "0"
+        if payload.get("dreamer_rl_action_space") and rl_kind_for_dreamer_mode(dreamer_mode) is None:
+            env["SIMLINGO_DREAMER_RL_ACTION_SPACE"] = str(payload["dreamer_rl_action_space"])
         checkpoint_map = {
             "dreamer_ppo": {
                 "path": SIMLINGO_ROOT / "checkpoints" / "dreamer_guard" / "best_world_model.pt",
@@ -422,20 +816,12 @@ def start_run(payload):
             "dreamer_ppo_rl_noguard": {
                 "path": SIMLINGO_ROOT / "checkpoints" / "dreamer_ppo_rl_noguard" / "latest_rl_model.pt",
                 "source": "dreamer_ppo_rl_noguard",
-                "help": (
-                    "Dreamer PPO RL no-guard checkpoint missing. Run a real RL training, "
-                    "then install its best checkpoint as "
-                    "external/simlingo/checkpoints/dreamer_ppo_rl_noguard/latest_rl_model.pt."
-                ),
+                "help": "Dreamer PPO RL no-guard checkpoint missing: external/simlingo/checkpoints/dreamer_ppo_rl_noguard/latest_rl_model.pt",
             },
             "dreamer_sdbs_rl_noguard": {
                 "path": SIMLINGO_ROOT / "checkpoints" / "dreamer_sdbs_rl_noguard" / "latest_rl_model.pt",
                 "source": "dreamer_sdbs_rl_noguard",
-                "help": (
-                    "Dreamer SDBS RL no-guard checkpoint missing. Run a real RL training, "
-                    "then install its best checkpoint as "
-                    "external/simlingo/checkpoints/dreamer_sdbs_rl_noguard/latest_rl_model.pt."
-                ),
+                "help": "Dreamer SDBS RL no-guard checkpoint missing: external/simlingo/checkpoints/dreamer_sdbs_rl_noguard/latest_rl_model.pt",
             },
         }
         checkpoint_info = checkpoint_map.get(dreamer_mode, checkpoint_map["dreamer_ppo"])
@@ -477,6 +863,54 @@ def start_run(payload):
         })
     launch_log = LOG_DIR / "latest_launch.log"
     env["SIMLINGO_VIEWER_LOG"] = str(ROOT / "logs" / "simlingo_eval" / "latest_pov_viewer.log")
+    online_rl_kind = rl_kind_for_dreamer_mode(dreamer_mode)
+    online_rl_enabled = bool(
+        online_rl_kind
+        and str(payload.get("dreamer_online_learning", "0")).lower() not in ("0", "false", "no", "off")
+    )
+    online_rl_meta = None
+    collector_proc = None
+    if online_rl_enabled:
+        if launch_script == "run_simlingo_with_action_dreaming_collect.sh":
+            launch_script = "run_simlingo_with_pov.sh"
+        run_id = time.strftime("%Y%m%d_%H%M%S")
+        run_dir = ROOT / "logs" / "dreamer_online_rl" / f"webapp_{run_id}_{online_rl_kind}_route_{route['id']}_seed_{seed}"
+        trace_path = run_dir / "trace.jsonl"
+        backup_dir = run_dir / "checkpoint_backups"
+        checkpoint = checkpoint_for_rl_kind(online_rl_kind)
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        if checkpoint.exists():
+            shutil.copy2(checkpoint, backup_dir / f"{online_rl_kind}_latest_rl_model_before_webapp_online.pt")
+        env.update({
+            "SIMLINGO_DREAMER_RL_TRAINING": "1",
+            "SIMLINGO_DREAMER_RL_DETERMINISTIC_EVAL": "0",
+            "SIMLINGO_DREAMER_RL_ACTION_SPACE": "absolute",
+            "ACTION_DREAMING_SAMPLE_INTERVAL": str(payload.get("action_dreaming_sample_interval", "0.10")),
+            "ACTION_DREAMING_OUT_DIR": str(run_dir),
+            "ACTION_DREAMING_RUN_ID": run_dir.name,
+            "ACTION_DREAMING_TRACE_PATH": str(trace_path),
+        })
+        (ROOT / "logs" / "dreamer_online_rl" / "latest_training.txt").parent.mkdir(parents=True, exist_ok=True)
+        (ROOT / "logs" / "dreamer_online_rl" / "latest_training.txt").write_text(str(run_dir) + "\n", encoding="utf-8")
+        online_rl_meta = {
+            "run_id": run_dir.name,
+            "run_dir": str(run_dir),
+            "kind": online_rl_kind,
+            "dreamer_mode": dreamer_mode,
+            "route_id": route["id"],
+            "town": route["town"],
+            "scenario": route["scenario_type"],
+            "seed": seed,
+            "trace_path": str(trace_path),
+            "checkpoint": str(checkpoint),
+            "started_at": time.time(),
+            "phase": "running_episode",
+            "no_guard": True,
+            "complement_to_simlingo": True,
+        }
+        write_online_rl_status(run_dir, online_rl_meta)
+        collector_proc, collector_log = start_online_rl_collector(env, run_dir, trace_path, route, seed)
+        online_rl_meta["collector_log"] = str(collector_log)
     launch_log.parent.mkdir(parents=True, exist_ok=True)
     launch_fh = launch_log.open("w", buffering=1, encoding="utf-8")
     print(f"[dashboard] started_at={time.strftime('%Y-%m-%d %H:%M:%S')}", file=launch_fh)
@@ -484,6 +918,9 @@ def start_run(payload):
     print(f"[dashboard] script={launch_script}", file=launch_fh)
     print(f"[dashboard] route={route['id']} town={route['town']} scenario={route['scenario_type']}", file=launch_fh)
     print(f"[dashboard] mode={run_mode} dreamer={dreamer_mode} cot={cot_mode} seed={seed}", file=launch_fh)
+    if online_rl_enabled:
+        print(f"[dashboard] online_rl=1 kind={online_rl_kind} run_dir={online_rl_meta['run_dir']}", file=launch_fh)
+        print(f"[dashboard] online_rl_trace={online_rl_meta['trace_path']}", file=launch_fh)
     print(f"[dashboard] port={port} tm_port={tm_port} display={env.get('DISPLAY', '<unset>')}", file=launch_fh)
     print(f"[dashboard] viewer_log={env['SIMLINGO_VIEWER_LOG']}", file=launch_fh)
     print("[dashboard] --- child output ---", file=launch_fh)
@@ -510,7 +947,24 @@ def start_run(payload):
             "started_at": time.time(),
             "launch_log": str(launch_log),
             "last_error": None,
+            "last_exit_code": None,
+            "online_rl_enabled": online_rl_enabled,
+            "online_rl_status": "running_episode" if online_rl_enabled else None,
+            "online_rl_run_dir": online_rl_meta["run_dir"] if online_rl_meta else None,
+            "online_rl_trace": online_rl_meta["trace_path"] if online_rl_meta else None,
+            "online_rl_update": None,
         })
+    threading.Thread(
+        target=monitor_run_completion,
+        args=(proc, collector_proc, online_rl_meta),
+        daemon=True,
+    ).start()
+    if online_rl_meta:
+        threading.Thread(
+            target=monitor_online_rl_blocked_episode,
+            args=(proc, online_rl_meta, env["SIMLINGO_DREAMER_STATUS_PATH"]),
+            daemon=True,
+        ).start()
     return {"ok": True, "route": route, "seed": seed}
 
 
@@ -753,6 +1207,52 @@ SAFE_DREAM_ACTION_TAXONOMY = (
 )
 
 
+DREAMER_GROUP_DEFS = {
+    "simlingo": {
+        "id": "simlingo",
+        "name": "SimLingo native",
+        "subtitle": "Baseline VLA closed-loop",
+    },
+    "dreamer_ppo": {
+        "id": "dreamer_ppo",
+        "name": "SimLingo + Dreamer PPO",
+        "subtitle": "Unified PPO Dreamer with runtime guard",
+    },
+    "dreamer_sdbs": {
+        "id": "dreamer_sdbs",
+        "name": "SimLingo + Dreamer SDBS",
+        "subtitle": "SDBS Dreamer with runtime guard",
+    },
+    "dreamer_ppo_rl": {
+        "id": "dreamer_ppo_rl",
+        "name": "SimLingo + PPO RL no-guard",
+        "subtitle": "Experimental RL checkpoint, no guard/shield/recovery filters",
+    },
+    "dreamer_sdbs_rl": {
+        "id": "dreamer_sdbs_rl",
+        "name": "SimLingo + SDBS RL no-guard",
+        "subtitle": "Experimental SDBS RL checkpoint, no guard/shield/recovery filters",
+    },
+}
+
+
+def dreamer_group_for_variant(variant, backend=""):
+    text = f"{variant or ''} {backend or ''}".lower()
+    if "sdbs_rl_noguard" in text:
+        return "dreamer_sdbs_rl"
+    if "ppo_rl_noguard" in text or "rl_noguard" in text:
+        return "dreamer_ppo_rl"
+    if "sdbs_complement" in text:
+        return "dreamer_sdbs"
+    if "ppo_complement" in text:
+        return "dreamer_ppo"
+    if "sdbs" in text:
+        return "dreamer_sdbs"
+    if text.strip() and text.strip() != "native":
+        return "dreamer_ppo"
+    return "native"
+
+
 def clamp01(value):
     try:
         return max(0.0, min(1.0, float(value)))
@@ -820,11 +1320,10 @@ def parse_bench2drive_result(path):
     infractions = record.get("infractions") or global_record.get("infractions", {})
     meta = record.get("meta") or global_record.get("meta", {})
     length_m = as_float(meta.get("route_length"), as_float(meta.get("total_length"), 0.0))
-    collisions = (
-        infraction_count(infractions.get("collisions_pedestrian"))
-        + infraction_count(infractions.get("collisions_vehicle"))
-        + infraction_count(infractions.get("collisions_layout"))
-    )
+    pedestrian_collisions = infraction_count(infractions.get("collisions_pedestrian"))
+    vehicle_collisions = infraction_count(infractions.get("collisions_vehicle"))
+    layout_collisions = infraction_count(infractions.get("collisions_layout"))
+    collisions = pedestrian_collisions + vehicle_collisions + layout_collisions
     red_lights = infraction_count(infractions.get("red_light"))
     stop_infractions = infraction_count(infractions.get("stop_infraction"))
     offroad = infraction_count(infractions.get("outside_route_lanes"))
@@ -845,6 +1344,9 @@ def parse_bench2drive_result(path):
         "driving_score": driving_score,
         "penalty": as_float(scores.get("score_penalty")),
         "collisions": collisions,
+        "pedestrian_collisions": pedestrian_collisions,
+        "vehicle_collisions": vehicle_collisions,
+        "layout_collisions": layout_collisions,
         "red_lights": red_lights,
         "stop_infractions": stop_infractions,
         "offroad": offroad,
@@ -906,9 +1408,8 @@ def parse_dreamer_log(path):
     try:
         with path.open("r", encoding="utf-8", errors="ignore") as handle:
             for line in handle:
-                if "SIMLINGO_DREAMER_GUARD enabled" in line:
+                if "SIMLINGO_DREAMER_GUARD enabled" in line or "SIMLINGO_DREAMER_RL_NOGUARD enabled" in line:
                     fields = parse_guard_line(line)
-                    info["group"] = "dreamer_v1"
                     variant = re.search(r"variant=([^\s]+)", line)
                     backend = fields.get("backend", "")
                     profile = fields.get("profile", "")
@@ -918,22 +1419,17 @@ def parse_dreamer_log(path):
                         info["variant"] = backend + (f"_{profile}" if profile else "")
                     elif profile:
                         info["variant"] = f"dreamer_guard_v1_{profile}"
-                    if "sdbs" in info["variant"].lower() or "sdbs" in backend.lower():
-                        info["group"] = "dreamer_sdbs"
-                    if "rl_noguard" in info["variant"].lower():
-                        info["group"] = "dreamer_sdbs_rl" if "sdbs" in info["variant"].lower() else "dreamer_ppo_rl"
-                if "SIMLINGO_DREAMER_GUARD step=" not in line:
+                    info["group"] = dreamer_group_for_variant(info["variant"], backend)
+                if "SIMLINGO_DREAMER_GUARD step=" not in line and "SIMLINGO_DREAMER_RL_NOGUARD step=" not in line:
                     continue
                 fields = parse_guard_line(line)
                 backend = fields.get("backend", "")
                 profile = fields.get("profile", "")
-                if "sdbs" in backend.lower():
-                    info["group"] = "dreamer_sdbs"
-                    if info["variant"] == "native":
-                        info["variant"] = backend + (f"_{profile}" if profile else "")
-                if "rl_noguard" in (info.get("variant") or "").lower() or "rl_noguard" in backend.lower():
-                    is_sdbs = "sdbs" in (info.get("variant") or "").lower() or "sdbs" in backend.lower()
-                    info["group"] = "dreamer_sdbs_rl" if is_sdbs else "dreamer_ppo_rl"
+                variant = fields.get("variant") or info.get("variant") or "native"
+                if info["variant"] == "native" and backend:
+                    variant = backend + (f"_{profile}" if profile else "")
+                    info["variant"] = variant
+                info["group"] = dreamer_group_for_variant(variant, backend)
                 info["guard_rows"] += 1
                 kind = fields.get("kind", "")
                 if kind:
@@ -976,13 +1472,7 @@ def mean_or_none(values):
 
 
 def safe_dream_model_groups():
-    groups = {
-        "simlingo": {"id": "simlingo", "name": "SimLingo native", "subtitle": "Baseline VLA closed-loop"},
-        "dreamer_v1": {"id": "dreamer_v1", "name": "SimLingo + Dreamer PPO", "subtitle": "Unified PPO Dreamer runtime guard"},
-        "dreamer_sdbs": {"id": "dreamer_sdbs", "name": "SimLingo + Dreamer SDBS", "subtitle": "SDBS checkpoint with unified runtime guard"},
-        "dreamer_ppo_rl": {"id": "dreamer_ppo_rl", "name": "SimLingo + Dreamer PPO RL", "subtitle": "No-guard RL policy, pending training"},
-        "dreamer_sdbs_rl": {"id": "dreamer_sdbs_rl", "name": "SimLingo + Dreamer SDBS RL", "subtitle": "No-guard SDBS RL policy, pending training"},
-    }
+    groups = {key: dict(value) for key, value in DREAMER_GROUP_DEFS.items()}
     for group in groups.values():
         group.update({
             "runs": [],
@@ -1005,7 +1495,11 @@ def safe_dream_model_groups():
             "latest_result": None,
         })
 
-    for result_path in sorted((ROOT / "logs" / "simlingo_eval").glob("results_*.json")):
+    result_paths = sorted(
+        (ROOT / "logs" / "simlingo_eval").glob("results_*.json"),
+        key=lambda path: path.stat().st_mtime,
+    )
+    for result_path in result_paths:
         log_path = run_log_for_result(result_path)
         log_info = parse_dreamer_log(log_path)
         group_key = log_info["group"]
@@ -1112,7 +1606,13 @@ def safe_dream_model_groups():
 
 def dreamer_comparison_payload():
     groups = safe_dream_model_groups()
-    comparison_keys = ["simlingo", "dreamer_v1", "dreamer_sdbs", "dreamer_ppo_rl", "dreamer_sdbs_rl"]
+    comparison_keys = [
+        "simlingo",
+        "dreamer_ppo",
+        "dreamer_sdbs",
+        "dreamer_ppo_rl",
+        "dreamer_sdbs_rl",
+    ]
     wm = load_json_file(DREAMER_ROOT / "outputs" / "simlingo_world_model_20260616" / "summary.json") or {}
     guard = load_json_file(DREAMER_ROOT / "outputs" / "simlingo_dreamer_guard_rm005_md005" / "summary.json") or {}
     guard_loose = load_json_file(DREAMER_ROOT / "outputs" / "simlingo_dreamer_guard_rm003_md003" / "summary.json") or {}
@@ -1133,6 +1633,7 @@ def dreamer_comparison_payload():
         headline = "no runs yet"
         if group["n"]:
             headline = f"{fmt_score(group['avg_route'])} route / {fmt_number(group['collisions'], 0)} coll"
+        latest = group.get("latest_result")
         metrics = [
             {"label": "Runs evaluated", "value": str(group["n"])},
             {"label": "Driving score", "value": fmt_score(group["avg_score"])},
@@ -1142,11 +1643,19 @@ def dreamer_comparison_payload():
             {"label": "Override rate", "value": fmt_percent(group["override_rate"])},
             {"label": "SAFE-DREAM DQI", "value": fmt_ratio(group["dreaming_quality_index"])},
         ]
+        if latest:
+            metrics.extend([
+                {"label": "Latest route", "value": f"{fmt_score(latest['route_score'])} / {latest['route_label']}"},
+                {"label": "Latest collisions", "value": fmt_number(latest["collisions"], 0)},
+                {"label": "Latest min-speed", "value": fmt_rate(latest["min_speed_infractions"])},
+            ])
         status = "reference" if key == "simlingo" else "active"
-        if key in ("dreamer_ppo_rl", "dreamer_sdbs_rl"):
-            status = "rl pending" if not group["n"] else "rl evaluated"
         if key == "dreamer_sdbs" and not sdbs_checkpoint.exists():
             status = "needs training"
+        if key == "dreamer_ppo_rl":
+            status = "rl no-guard" if ppo_rl_checkpoint.exists() else "needs training"
+        if key == "dreamer_sdbs_rl":
+            status = "rl no-guard" if sdbs_rl_checkpoint.exists() else "needs training"
         note = checkpoint_note or "Computed from local Bench2Drive JSON results and matching run logs."
         if group.get("incomplete_result_count"):
             note += f" {group['incomplete_result_count']} trace run(s) detected but not counted because Bench2Drive did not write eligible scores."
@@ -1168,32 +1677,26 @@ def dreamer_comparison_payload():
 
     cards = [
         card_for("simlingo", "Native baseline: no Dreamer/guard intervention, only Bench2Drive closed-loop metrics."),
-        card_for("dreamer_v1", "Unified Dreamer PPO guard. Legacy offline override rate: " + fmt_percent(legacy_guard_override) + "."),
+        card_for("dreamer_ppo", "Runtime guard/recovery/shield enabled. Legacy offline override rate: " + fmt_percent(legacy_guard_override) + "."),
         card_for(
             "dreamer_sdbs",
             (
-                "Dreamer SDBS checkpoint installed; "
-                if sdbs_checkpoint.exists() else "Dreamer SDBS checkpoint missing; "
+                "Runtime guard/recovery/shield enabled. SDBS checkpoint installed; "
+                if sdbs_checkpoint.exists() else "Runtime guard/recovery/shield enabled. SDBS checkpoint missing; "
             )
             + f"state={sdbs_summary.get('state_dim', 28)}D, transitions={sdbs_summary.get('transitions', '-')}, best_loss={fmt_number((sdbs_summary.get('best') or {}).get('loss'), 4)}.",
         ),
         card_for(
             "dreamer_ppo_rl",
-            (
-                "Dreamer PPO RL no-guard checkpoint installed; "
-                if ppo_rl_checkpoint.exists() else
-                "Dreamer PPO RL no-guard checkpoint missing; train/install latest_rl_model.pt first. "
-            )
-            + "Uses the no-guard full candidate scorer path.",
+            "No guard runtime: guard=0, recovery=0, collision_shield=0. Uses latest PPO RL checkpoint."
+            if ppo_rl_checkpoint.exists()
+            else "No guard runtime slot. Missing latest PPO RL checkpoint.",
         ),
         card_for(
             "dreamer_sdbs_rl",
-            (
-                "Dreamer SDBS RL no-guard checkpoint installed; "
-                if sdbs_rl_checkpoint.exists() else
-                "Dreamer SDBS RL no-guard checkpoint missing; train/install latest_rl_model.pt first. "
-            )
-            + "Uses the no-guard full candidate scorer path.",
+            "No guard runtime: guard=0, recovery=0, collision_shield=0. Uses latest SDBS RL checkpoint."
+            if sdbs_rl_checkpoint.exists()
+            else "No guard runtime slot. Missing latest SDBS RL checkpoint.",
         ),
     ]
 
@@ -1201,14 +1704,8 @@ def dreamer_comparison_payload():
         return formatter(groups[key].get(metric))
 
     def row(label, metric, formatter=fmt_ratio):
-        return {
-            "label": label,
-            "simlingo": val("simlingo", metric, formatter),
-            "dreamer_v1": val("dreamer_v1", metric, formatter),
-            "dreamer_sdbs": val("dreamer_sdbs", metric, formatter),
-            "dreamer_ppo_rl": val("dreamer_ppo_rl", metric, formatter),
-            "dreamer_sdbs_rl": val("dreamer_sdbs_rl", metric, formatter),
-        }
+        values = {key: val(key, metric, formatter) for key in comparison_keys}
+        return {"label": label, "values": values, **values}
 
     rows = [
         row("Family E - Runs evaluated", "n", lambda v: "-" if v is None else str(int(v))),
@@ -1233,30 +1730,31 @@ def dreamer_comparison_payload():
         row("Family D Eq.11 - Dreaming Quality Index DQI", "dreaming_quality_index", fmt_ratio),
         {
             "label": "Evidence - Latest result file",
-            "simlingo": Path(groups["simlingo"]["latest_result"]["path"]).name if groups["simlingo"]["latest_result"] else "-",
-            "dreamer_v1": Path(groups["dreamer_v1"]["latest_result"]["path"]).name if groups["dreamer_v1"]["latest_result"] else "-",
-            "dreamer_sdbs": Path(groups["dreamer_sdbs"]["latest_result"]["path"]).name if groups["dreamer_sdbs"]["latest_result"] else "-",
-            "dreamer_ppo_rl": Path(groups["dreamer_ppo_rl"]["latest_result"]["path"]).name if groups["dreamer_ppo_rl"]["latest_result"] else "-",
-            "dreamer_sdbs_rl": Path(groups["dreamer_sdbs_rl"]["latest_result"]["path"]).name if groups["dreamer_sdbs_rl"]["latest_result"] else "-",
+            "values": {
+                key: Path(groups[key]["latest_result"]["path"]).name if groups[key]["latest_result"] else "-"
+                for key in comparison_keys
+            },
         },
         {
             "label": "Evidence - Variants detected",
-            "simlingo": ", ".join(sorted(groups["simlingo"]["variants"])) or "-",
-            "dreamer_v1": ", ".join(sorted(groups["dreamer_v1"]["variants"])) or "-",
-            "dreamer_sdbs": ", ".join(sorted(groups["dreamer_sdbs"]["variants"])) or "-",
-            "dreamer_ppo_rl": ", ".join(sorted(groups["dreamer_ppo_rl"]["variants"])) or "-",
-            "dreamer_sdbs_rl": ", ".join(sorted(groups["dreamer_sdbs_rl"]["variants"])) or "-",
+            "values": {
+                key: ", ".join(sorted(groups[key]["variants"])) or "-"
+                for key in comparison_keys
+            },
         },
     ]
+    for item in rows[-2:]:
+        item.update(item["values"])
 
     return {
         "ok": True,
+        "columns": [{"id": key, "label": groups[key]["name"]} for key in comparison_keys],
         "source": "SAFE-DREAM dashboard adapter over local Bench2Drive result JSONs and SimLingo/Dreamer run logs",
         "runme_kpis": [
             "Family E metrics are direct Bench2Drive outcomes: driving score, route completion, collisions, off-road, traffic-rule and blocked-agent rates.",
             "Family D metrics are derived from Dreamer traces: CC from observed candidate kinds, FD from candidate diversity, SG from base-risk minus chosen-risk, and UFRR from shielded unsafe futures.",
+            "RL no-guard columns are runtime no-guard modes: SIMLINGO_DREAMER_GUARD=0, recovery=0, collision_shield=0, logged as SIMLINGO_DREAMER_RL_NOGUARD.",
             "Metrics marked as proxy are valid for comparison inside this pipeline but should be reported as log-derived SAFE-DREAM proxies, not full rollout-ground-truth measurements.",
-            "RL no-guard columns are reserved for the next training stage; they remain empty until their backend policies/checkpoints are wired and evaluated.",
             "Legacy PPO offline summary: override " + fmt_percent(legacy_guard_override) + ", loose override " + fmt_percent(legacy_loose_override) + ", candidate agreement " + fmt_percent(pure_agreement) + ", WM loss " + fmt_number(wm_best.get("loss"), 4) + ".",
         ],
         "all_runs": [
@@ -1591,7 +2089,7 @@ HTML = r"""<!doctype html>
     }
     .telemetry {
       display: grid;
-      grid-template-columns: repeat(7, minmax(0, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
       gap: 12px;
       margin-bottom: 24px;
     }
@@ -1924,10 +2422,17 @@ HTML = r"""<!doctype html>
               <option value="off">Off - native SimLingo</option>
               <option value="dreamer_ppo">Dreamer PPO</option>
               <option value="dreamer_sdbs">Dreamer SDBS</option>
-              <option value="dreamer_ppo_rl_noguard">Dreamer PPO RL no guard</option>
-              <option value="dreamer_sdbs_rl_noguard">Dreamer SDBS RL no guard</option>
+              <option value="dreamer_ppo_rl_noguard">Dreamer PPO RL no-guard</option>
+              <option value="dreamer_sdbs_rl_noguard">Dreamer SDBS RL no-guard</option>
             </select></label>
             <label>Dreamer overlay<input type="text" value="Pygame live panel + replay" disabled></label>
+          </div>
+          <div class="split">
+            <label>RL update<select id="dreamer_online_learning">
+              <option value="0">Off - run only</option>
+              <option value="1">Training session</option>
+            </select></label>
+            <label>Dreamer role<input type="text" value="Learned blend with SimLingo" disabled></label>
           </div>
           <div class="split">
             <label>External CoT<select id="cot_mode">
@@ -2035,7 +2540,7 @@ HTML = r"""<!doctype html>
       <div class="compare-head">
         <div>
           <h3>SAFE-DREAM KPI Comparison</h3>
-          <p>Same Family D/E metrics for native SimLingo, guarded Dreamer PPO/SDBS, and upcoming RL no-guard variants.</p>
+          <p>Same Family D/E metrics for native SimLingo, guarded Dreamer PPO/SDBS, and RL no-guard complement variants.</p>
         </div>
         <button class="compare-refresh" id="refreshCompare">Refresh KPIs</button>
       </div>
@@ -2043,17 +2548,12 @@ HTML = r"""<!doctype html>
       <div class="kpi-table-wrap">
         <table class="kpi-table">
           <thead>
-            <tr>
+            <tr id="compareHeadRow">
               <th>KPI</th>
-              <th>SimLingo native</th>
-              <th>Dreamer PPO</th>
-              <th>Dreamer SDBS</th>
-              <th>PPO RL no guard</th>
-              <th>SDBS RL no guard</th>
             </tr>
           </thead>
           <tbody id="compareRows">
-            <tr><td colspan="6">Loading comparison...</td></tr>
+            <tr><td>Loading comparison...</td></tr>
           </tbody>
         </table>
       </div>
@@ -2144,14 +2644,12 @@ HTML = r"""<!doctype html>
           <p class="compare-note">${esc(card.note)}</p>
         </article>
       `).join("");
+      const columns = data.columns || [];
+      $("compareHeadRow").innerHTML = `<th>KPI</th>${columns.map(col => `<th>${esc(col.label)}</th>`).join("")}`;
       $("compareRows").innerHTML = data.rows.map(row => `
         <tr>
           <td>${esc(row.label)}</td>
-          <td>${esc(row.simlingo)}</td>
-          <td>${esc(row.dreamer_v1)}</td>
-          <td>${esc(row.dreamer_sdbs)}</td>
-          <td>${esc(row.dreamer_ppo_rl)}</td>
-          <td>${esc(row.dreamer_sdbs_rl)}</td>
+          ${columns.map(col => `<td>${esc((row.values || {})[col.id])}</td>`).join("")}
         </tr>
       `).join("");
       $("observedRuns").innerHTML = (data.all_runs || []).map(group => `
@@ -2236,6 +2734,8 @@ HTML = r"""<!doctype html>
         playback_speed: $("playback_speed").value,
         run_mode: modeOverride || $("run_mode").value,
         dreamer_mode: $("dreamer_mode").value,
+        dreamer_online_learning: $("dreamer_online_learning").value,
+        dreamer_rl_action_space: "absolute",
         cot_mode: $("cot_mode").value,
         cot_interval: $("cot_interval").value,
         cot_model: "Qwen/Qwen2-VL-7B-Instruct",
@@ -2259,12 +2759,15 @@ HTML = r"""<!doctype html>
         off: "native SimLingo",
         dreamer_ppo: "Dreamer PPO",
         dreamer_sdbs: "Dreamer SDBS",
-        dreamer_ppo_rl_noguard: "Dreamer PPO RL no guard",
-        dreamer_sdbs_rl_noguard: "Dreamer SDBS RL no guard"
+        dreamer_ppo_rl_noguard: "Dreamer PPO RL no-guard",
+        dreamer_sdbs_rl_noguard: "Dreamer SDBS RL no-guard"
       };
       const dreamerText = dreamerLabels[payload.dreamer_mode] || payload.dreamer_mode;
       const cotText = payload.cot_mode === "off" ? "CoT off" : `CoT ${payload.cot_mode}`;
-      $("status").textContent = `Launching ${modeText} / ${dreamerText} / ${cotText}: route ${data.route.id}, seed ${data.seed}.`;
+      const rlText = payload.dreamer_online_learning === "1"
+        ? "online RL training ON"
+        : "checkpoint update OFF";
+      $("status").textContent = `Launching ${modeText} / ${dreamerText} / ${cotText} / ${rlText}: route ${data.route.id}, seed ${data.seed}.`;
       refreshStatus();
     }
     async function stopRun() {
@@ -2292,12 +2795,27 @@ HTML = r"""<!doctype html>
       $("mMode").textContent = data.mode === "sumo_mirror"
         ? "CARLA + SUMO"
         : (data.mode === "action_dreaming" ? "Action Dreaming" : (data.mode || "-"));
-      $("mDreamer").textContent = data.dreamer_mode || "off";
+      const onlineStatus = data.online_rl_enabled ? ` / online ${data.online_rl_status || "running"}` : "";
+      $("mDreamer").textContent = `${data.dreamer_mode || "off"}${onlineStatus}`;
       $("mCot").textContent = data.cot_mode || "off";
       $("mSeed").textContent = data.seed || "-";
       $("mProcess").textContent = data.running ? "running" : "idle";
-      $("topStatus").textContent = data.running ? "simulation running" : "idle";
+      $("topStatus").textContent = data.running
+        ? "simulation running"
+        : (data.online_rl_enabled && data.online_rl_status === "updating_checkpoint" ? "online RL updating" : "idle");
       if (data.last_error) $("status").textContent = data.last_error;
+      else if (data.online_rl_enabled) {
+        const update = data.online_rl_update || {};
+        if (data.online_rl_status === "running_episode") {
+          $("status").textContent = `Online RL episode running. Trace: ${data.online_rl_trace || "-"}`;
+        } else if (data.online_rl_status === "updating_checkpoint") {
+          $("status").textContent = `Online RL update in progress. Run: ${data.online_rl_run_dir || "-"}`;
+        } else if (data.online_rl_status === "done") {
+          $("status").textContent = `Online RL ${update.status || "done"}: ${update.transitions ?? "-"} transitions, reward ${update.reward_sum ?? "-"}.`;
+        } else if (data.online_rl_status === "failed") {
+          $("status").textContent = `Online RL failed: ${update.error || "see logs"}`;
+        }
+      }
     }
     $("town").onchange = updateRouteOptions;
     $("scenario").onchange = updateRouteOptions;
@@ -2385,7 +2903,9 @@ class Handler(BaseHTTPRequestHandler):
                 proc = STATE.get("process")
                 exit_code = proc.poll() if proc else None
                 running = bool(proc and exit_code is None)
-                if proc and exit_code not in (None, 0) and not STATE.get("last_error"):
+                if exit_code is None and not running:
+                    exit_code = STATE.get("last_exit_code")
+                if proc and not expected_stop_exit(exit_code) and not STATE.get("last_error"):
                     STATE["last_error"] = (
                         f"Simulation exited with code {exit_code}. "
                         f"Launch log: {STATE.get('launch_log') or 'unavailable'}"

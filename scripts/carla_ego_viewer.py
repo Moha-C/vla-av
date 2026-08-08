@@ -224,7 +224,8 @@ def draw_dreamer_overlay(screen, font, width, status):
 
     panel_w = min(560, max(360, width - 410))
     gap_sides = status.get("gap_recovery_sides") or []
-    panel_h = 172 if status.get("collision_shield_active") or gap_sides else 150
+    is_rl_complement = str(status.get("mode", "")).lower() == "rl_noguard"
+    panel_h = 172 if status.get("collision_shield_active") or gap_sides or is_rl_complement else 150
     x = width - panel_w - 16
     y = 16
     surface = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
@@ -237,6 +238,12 @@ def draw_dreamer_overlay(screen, font, width, status):
     if stale:
         badge = "STALE"
         color = (148, 163, 184)
+    elif is_rl_complement and not applied:
+        badge = "SIMLINGO"
+        color = (110, 231, 249)
+    elif is_rl_complement:
+        badge = "LEARNED BLEND"
+        color = (126, 242, 162)
     elif applied:
         badge = "APPLIED"
         color = (126, 242, 162)
@@ -292,8 +299,16 @@ def draw_dreamer_overlay(screen, font, width, status):
         "B "
         f"{float(base.get('brake', 0.0)):.2f}->{float(chosen.get('brake', 0.0)):.2f}"
     )
+    mix_line = (
+        f"learned gate  SimLingo {100.0 * float(status.get('simlingo_weight', 1.0)):.0f}%  /  "
+        f"Dreamer {100.0 * float(status.get('dreamer_weight', 0.0)):.0f}%  "
+        f"delta {float(status.get('rl_control_delta', 0.0)):.3f}  "
+        f"| no guard {int(bool(status.get('no_guard', False)))}"
+    )
 
     lines = [risk_line, scene_line, clearance_line, oncoming_line, action_line]
+    if is_rl_complement:
+        lines.insert(1, mix_line)
     if status.get("collision_shield_active"):
         reason = str(status.get("collision_shield_reason", ""))
         lines.append(f"shield active: {reason[:82]}")
