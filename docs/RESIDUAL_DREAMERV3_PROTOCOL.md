@@ -6,6 +6,12 @@ This is a new isolated branch. It does not replace the working SimLingo,
 Dreamer guard, SUMO bridge, dashboard, or historical checkpoints. It is not
 exposed as a driving option until it passes every gate below.
 
+The full v2 audit completed on 2026-09-01 and **failed Gate 2**. The best
+checkpoint improved reward and risk prediction, but its normalized open-loop
+observation MSE was 77.53% worse than the best frozen baseline. No actor was
+trained and no runtime checkpoint was changed. See
+[the frozen audit report](RESIDUAL_DREAMERV3_AUDIT_20260901.md).
+
 The implementation is a PyTorch/Python 3.8 adaptation of DreamerV3 mechanisms,
 not a copy of the official JAX agent and not a claim that the current candidate
 already outperforms SimLingo.

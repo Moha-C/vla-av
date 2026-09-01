@@ -152,6 +152,7 @@ a residual action plus continuous authority. Its protocol is documented in:
 - [Report-aligned architecture](docs/REPORT_ALIGNED_DREAMER_ARCHITECTURE.md)
 - [Frozen validation protocol](docs/REPORT_ALIGNED_DREAMER_PROTOCOL.md)
 - [Residual DreamerV3 protocol](docs/RESIDUAL_DREAMERV3_PROTOCOL.md)
+- [Residual DreamerV3 v2 audit result](docs/RESIDUAL_DREAMERV3_AUDIT_20260901.md)
 - [Third-party attribution](docs/THIRD_PARTY_DREAMER_ATTRIBUTION.md)
 
 Run the report branch software tests with:
@@ -169,6 +170,8 @@ bash scripts/run_residual_dreamerv3_pipeline.sh
 
 A candidate is never substituted for the promoted runtime model automatically.
 Prediction gates and frozen closed-loop evaluation must pass first.
+The full residual DreamerV3 v2 run from 2026-09-01 failed its frozen
+world-model gate, so no actor was trained from that candidate.
 
 ## Privacy And Artifact Policy
 
