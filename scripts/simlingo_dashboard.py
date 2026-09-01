@@ -2,6 +2,7 @@
 import csv
 import glob
 import json
+import math
 import mimetypes
 import os
 import random
@@ -32,6 +33,15 @@ STABLE_TOWNS = {
     if town.strip()
 }
 SHOW_EXPERIMENTAL_TOWNS = os.environ.get("SIMLINGO_DASHBOARD_SHOW_EXPERIMENTAL", "1").lower() in ("1", "true", "yes")
+READ_ONLY = os.environ.get("SIMLINGO_DASHBOARD_READ_ONLY", "0").lower() in ("1", "true", "yes")
+DASHBOARD_HOST = os.environ.get("SIMLINGO_DASHBOARD_HOST", "127.0.0.1")
+REPORT_DREAMER_MATRIX_ID = os.environ.get(
+    "REPORT_DREAMER_MATRIX_ID", "native_report12_v1"
+)
+REPORT_DREAMER_TRAINING_UNIT = os.environ.get(
+    "REPORT_DREAMER_TRAINING_UNIT",
+    "vla-av-report-dreamer-training-native-report12-v1.service",
+)
 
 STATE = {
     "process": None,
@@ -40,6 +50,7 @@ STATE = {
     "scenario": None,
     "mode": None,
     "dreamer_mode": "off",
+    "report_checkpoint_role": None,
     "cot_mode": "off",
     "seed": None,
     "port": 2000,
@@ -63,6 +74,19 @@ ASSET_FILES = {
     "bench2drive_benchmark.jpg": SIMLINGO_ROOT / "Bench2Drive" / "assets" / "benchmark.jpg",
     "carla_header.png": SIMLINGO_ROOT / "leaderboard" / "docs" / "img" / "carla_header.png",
 }
+
+
+def share_safe_payload(value):
+    """Hide workstation paths from the read-only presentation server."""
+    if not READ_ONLY:
+        return value
+    if isinstance(value, dict):
+        return {key: share_safe_payload(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [share_safe_payload(item) for item in value]
+    if isinstance(value, str):
+        return value.replace(str(ROOT), "<project>").replace(str(Path.home()), "~")
+    return value
 
 
 def installed_towns():
@@ -228,12 +252,62 @@ def rl_kind_for_dreamer_mode(dreamer_mode):
     return None
 
 
-def checkpoint_for_rl_kind(kind):
+def checkpoint_for_rl_kind(kind, role="production"):
     if kind == "ppo":
-        return SIMLINGO_ROOT / "checkpoints" / "dreamer_ppo_rl_noguard" / "latest_rl_model.pt"
-    if kind == "sdbs":
-        return SIMLINGO_ROOT / "checkpoints" / "dreamer_sdbs_rl_noguard" / "latest_rl_model.pt"
-    raise ValueError(f"unknown RL kind: {kind}")
+        directory = SIMLINGO_ROOT / "checkpoints" / "dreamer_ppo_rl_noguard"
+    elif kind == "sdbs":
+        directory = SIMLINGO_ROOT / "checkpoints" / "dreamer_sdbs_rl_noguard"
+    else:
+        raise ValueError(f"unknown RL kind: {kind}")
+    role_names = {
+        "production": "production_model.pt",
+        "candidate": "candidate_model.pt",
+        "best": "best_model.pt",
+        "legacy": "latest_rl_model.pt",
+    }
+    if role not in role_names:
+        raise ValueError(f"unknown checkpoint role: {role}")
+    selected = directory / role_names[role]
+    if selected.exists():
+        return selected
+    # SDBS and older workspaces may not have role files yet.
+    legacy = directory / role_names["legacy"]
+    return legacy if legacy.exists() else selected
+
+
+def checkpoint_for_rssm_v2(directory=None, prefer_calibrated=None):
+    directory = Path(directory) if directory is not None else (
+        SIMLINGO_ROOT / "checkpoints" / "dreamer_ppo_rssm_v2"
+    )
+    candidate = directory / "candidate_model.pt"
+    calibrated = directory / "utility_calibrator_candidate_pre_ab.pt"
+    if prefer_calibrated is None:
+        prefer_calibrated = str(
+            os.environ.get("SIMLINGO_RSSM_USE_EXPERIMENTAL_CALIBRATOR", "0")
+        ).lower() in ("1", "true", "yes", "on")
+    if prefer_calibrated and calibrated.exists():
+        return calibrated, "dreamer_ppo_rssm_v2_calibrated_action_shooting_candidate"
+    if candidate.exists():
+        return candidate, "dreamer_ppo_rssm_v2_known_good_candidate"
+    if calibrated.exists():
+        return calibrated, "dreamer_ppo_rssm_v2_calibrated_fallback"
+    return candidate, "dreamer_ppo_rssm_v2_missing_candidate"
+
+
+def payload_enabled(value):
+    return str(value if value is not None else "0").lower() not in (
+        "0", "false", "no", "off", "", "none",
+    )
+
+
+def validated_checkpoint_override(raw_path):
+    checkpoint = Path(str(raw_path)).expanduser().resolve()
+    checkpoint_root = (SIMLINGO_ROOT / "checkpoints").resolve()
+    if os.path.commonpath((str(checkpoint), str(checkpoint_root))) != str(checkpoint_root):
+        raise ValueError("Dreamer checkpoint override must stay inside external/simlingo/checkpoints.")
+    if not checkpoint.is_file():
+        raise FileNotFoundError(checkpoint)
+    return checkpoint
 
 
 def trace_rl_rows(path):
@@ -262,6 +336,21 @@ def trace_total_rows(path):
             if line.strip():
                 count += 1
     return count
+
+
+def read_first_collision_event(path):
+    path = Path(path) if path else None
+    if path is None or not path.exists():
+        return None
+    try:
+        with path.open(encoding="utf-8") as handle:
+            events = [json.loads(line) for line in handle if line.strip()]
+    except (OSError, json.JSONDecodeError):
+        return None
+    events = [event for event in events if event.get("event") == "collision"]
+    if not events:
+        return None
+    return min(events, key=lambda event: float(event.get("wall_time", float("inf"))))
 
 
 def write_online_rl_status(run_dir, payload):
@@ -356,11 +445,34 @@ def monitor_online_rl_blocked_episode(proc, meta, status_path):
         0,
         int(os.environ.get("DREAMER_ONLINE_RL_BLOCKED_TRUNCATE_TICKS", "800")),
     )
-    if threshold <= 0:
-        return
     status_path = Path(status_path)
     while proc.poll() is None:
-        time.sleep(0.5)
+        time.sleep(0.2)
+        collision_event = read_first_collision_event(meta.get("collision_events_path"))
+        if collision_event is not None:
+            run_dir = Path(meta["run_dir"])
+            marker = {
+                "reason": "first_real_collision",
+                "collision_event": collision_event,
+                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "checkpoint_update_requested": True,
+                "driving_guard_used": False,
+            }
+            (run_dir / "auto_truncate.json").write_text(
+                json.dumps(marker, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            with STATE_LOCK:
+                if STATE.get("process") is proc:
+                    STATE["online_rl_status"] = "truncating_collision_episode"
+                    STATE["online_rl_update"] = marker
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            return
+        if threshold <= 0:
+            continue
         try:
             status = json.loads(status_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError, OSError):
@@ -401,11 +513,15 @@ def run_online_rl_update(meta, exit_code):
     run_dir = Path(meta["run_dir"])
     trace_path = Path(meta["trace_path"])
     kind = meta["kind"]
-    checkpoint = checkpoint_for_rl_kind(kind)
+    checkpoint = checkpoint_for_rl_kind(kind, "candidate")
     result_path = latest_result_after(meta["started_at"])
     metrics = parse_bench2drive_result(result_path) if result_path else None
+    collision_event = read_first_collision_event(meta.get("collision_events_path"))
+    collision_kind = str((collision_event or {}).get("collision_kind", ""))
     manual_stop = bool(meta.get("manual_stop"))
     if manual_stop or metrics is None:
+        impact_detected = collision_event is not None
+        generic_failure = manual_stop or not expected_stop_exit(exit_code)
         metrics = {
             "path": str(result_path) if result_path else "",
             "status": "manual_stop_incomplete" if manual_stop else "incomplete_or_ineligible",
@@ -413,14 +529,14 @@ def run_online_rl_update(meta, exit_code):
             "route_score": 0.0,
             "driving_score": 0.0,
             "penalty": 0.0,
-            "collisions": 1.0 if manual_stop or not expected_stop_exit(exit_code) else 0.0,
-            "pedestrian_collisions": 0.0,
-            "vehicle_collisions": 1.0 if manual_stop or not expected_stop_exit(exit_code) else 0.0,
-            "layout_collisions": 0.0,
+            "collisions": 1.0 if impact_detected or generic_failure else 0.0,
+            "pedestrian_collisions": 1.0 if collision_kind == "pedestrian" else 0.0,
+            "vehicle_collisions": 1.0 if collision_kind == "vehicle" or (generic_failure and not impact_detected) else 0.0,
+            "layout_collisions": 1.0 if collision_kind == "static" else 0.0,
             "red_lights": 0.0,
             "stop_infractions": 0.0,
-            "offroad": 1.0 if manual_stop or not expected_stop_exit(exit_code) else 0.0,
-            "blocked": 1.0,
+            "offroad": 1.0 if generic_failure and not impact_detected else 0.0,
+            "blocked": 0.0 if impact_detected else 1.0,
             "scenario_timeouts": 0.0,
             "route_timeouts": 0.0,
             "min_speed_infractions": 0.0,
@@ -458,6 +574,12 @@ def run_online_rl_update(meta, exit_code):
         str(checkpoint),
         "--metrics-json",
         json.dumps(metrics or {}),
+        "--collision-events",
+        str(meta.get("collision_events_path") or ""),
+        "--positive-replay-root",
+        str(ROOT / "logs" / "dreamer_online_rl"),
+        "--positive-replay-count",
+        os.environ.get("DREAMER_ONLINE_RL_POSITIVE_REPLAY_COUNT", "3"),
         "--summary",
         str(summary_path),
         "--device",
@@ -575,6 +697,9 @@ def start_run(payload):
     playback_speed = payload.get("playback_speed", "5")
     video_quality = payload.get("video_quality")
     run_mode = payload.get("run_mode", "pov")
+    allowed_run_modes = {"pov", "sumo_mirror", "action_dreaming", "report_native_collect"}
+    if run_mode not in allowed_run_modes:
+        raise ValueError(f"Unsupported launch mode: {run_mode}")
     dreamer_mode = payload.get("dreamer_mode", "off")
     cot_mode = payload.get("cot_mode", "off")
     if video_quality == "epic":
@@ -608,9 +733,18 @@ def start_run(payload):
         "SIMLINGO_TRAFFIC_LIGHT_OVERLAY_MAX": str(payload.get("traffic_light_overlay_max", "80")),
         "SIMLINGO_PLAYBACK_AFTER": str(payload.get("playback_after", "1")),
         "SIMLINGO_PLAYBACK_SPEED": str(playback_speed),
+        "SIMLINGO_RECORD": str(payload.get("record_video", "1")),
         "SIMLINGO_OUT_DIR": str(ROOT / "logs" / "simlingo_eval"),
         "SIMLINGO_DREAMER_STATUS_PATH": str(ROOT / "logs" / "simlingo_eval" / "dreamer_guard_status.json"),
         "SIMLINGO_DREAMER_GUARD": "0",
+        "SIMLINGO_DREAMER_RUNTIME": "",
+        "SIMLINGO_REPORT_DREAMER_MODE": "off",
+        "SIMLINGO_REPORT_DREAMER_SHADOW": "0",
+        "SIMLINGO_REPORT_DREAMER_CONFIG": str(ROOT / "configs" / "dreamer_report_aligned.yaml"),
+        "SIMLINGO_REPORT_NATIVE_TRACE": "",
+        "SIMLINGO_CARDREAMER_MODE": "off",
+        "SIMLINGO_CARDREAMER_STATUS_PATH": str(ROOT / "logs" / "simlingo_eval" / "cardreamer_runtime_status.json"),
+        "SIMLINGO_CARDREAMER_CONTROL_STATUS_PATH": str(ROOT / "logs" / "simlingo_eval" / "cardreamer_residual_control.json"),
         "SIMLINGO_VLM_COT": str(cot_mode),
         "SIMLINGO_VLM_COT_MODEL": str(payload.get("cot_model") or "Qwen/Qwen2-VL-7B-Instruct"),
         "SIMLINGO_VLM_COT_INTERVAL": str(payload.get("cot_interval") or "2.0"),
@@ -621,8 +755,12 @@ def start_run(payload):
         "SIMLINGO_VLM_COT_LOG_PATH": str(ROOT / "logs" / "simlingo_eval" / "vlm_cot_reasoning.jsonl"),
         "SUMO_HOME": os.environ.get("SUMO_HOME", "/usr/share/sumo"),
     })
+    if payload.get("collision_events_path"):
+        env["SIMLINGO_COLLISION_EVENT_PATH"] = str(payload["collision_events_path"])
     for live_status_key in (
         "SIMLINGO_DREAMER_STATUS_PATH",
+        "SIMLINGO_CARDREAMER_STATUS_PATH",
+        "SIMLINGO_CARDREAMER_CONTROL_STATUS_PATH",
         "SIMLINGO_VLM_COT_STATUS_PATH",
         "SIMLINGO_VLM_COT_FRAME_PATH",
     ):
@@ -786,6 +924,12 @@ def start_run(payload):
         **dreamer_presets["dreamer_ppo_rl_noguard"],
         "SIMLINGO_DREAMER_VARIANT": "dreamer_sdbs_rl_noguard",
     }
+    dreamer_presets["dreamer_ppo_rssm_v2"] = {
+        **dreamer_presets["dreamer_ppo_rl_noguard"],
+        "SIMLINGO_DREAMER_VARIANT": "dreamer_ppo_rssm_v2",
+        "SIMLINGO_DREAMER_RL_TRAINING": "0",
+        "SIMLINGO_DREAMER_RL_DETERMINISTIC_EVAL": "1",
+    }
     dreamer_aliases = {
         "shadow": "dreamer_ppo",
         "guard": "dreamer_ppo",
@@ -795,13 +939,138 @@ def start_run(payload):
         "sdbs_fresh_accident_overtake": "dreamer_sdbs",
     }
     dreamer_mode = dreamer_aliases.get(dreamer_mode, dreamer_mode)
+    report_modes = {
+        "report_rssm_shadow": {"ablation": "D", "mode": "shadow", "shadow": "1"},
+        "report_rssm_fixed": {"ablation": "C", "mode": "apply", "shadow": "0"},
+        "report_rssm_learned": {"ablation": "D", "mode": "apply", "shadow": "0"},
+        "report_rssm_pairwise": {"ablation": "E", "mode": "apply", "shadow": "0"},
+    }
+    report_checkpoint_role = None
+    if dreamer_mode in report_modes:
+        report_profile = report_modes[dreamer_mode]
+        if payload_enabled(payload.get("dreamer_online_learning")):
+            raise ValueError(
+                "The report-aligned RSSM follows the documented offline world-model "
+                "and imagined actor/critic protocol. Disable the legacy online-RL toggle."
+            )
+        report_checkpoint_role = str(
+            payload.get("report_checkpoint_role") or "production"
+        ).strip().lower()
+        if report_checkpoint_role not in ("candidate", "production"):
+            raise ValueError("Report checkpoint role must be candidate or production.")
+        report_checkpoint_root = (
+            ROOT
+            / "checkpoints"
+            / "report_aligned_dreamer"
+            / report_checkpoint_role
+        )
+        checkpoint = (
+            report_checkpoint_root / "report_dreamer_candidate.pt"
+            if report_checkpoint_role == "candidate"
+            else report_checkpoint_root / (
+                "report_dreamer_pairwise.pt"
+                if report_profile["ablation"] == "E"
+                else "report_dreamer.pt"
+            )
+        )
+        if (
+            report_profile["ablation"] == "E"
+            and report_checkpoint_role == "candidate"
+            and not (report_checkpoint_root / "pairwise_candidate.pt").is_file()
+        ):
+            raise RuntimeError(
+                "Report E needs a separately trained pairwise calibrator. The current "
+                "candidate contains only the RSSM and imagined actor/critic heads."
+            )
+        if not checkpoint.exists():
+            raise RuntimeError(
+                f"Report-aligned Dreamer {report_checkpoint_role} checkpoint missing: "
+                f"{checkpoint}. A random or smoke checkpoint will not be substituted."
+            )
+        report_run_id = time.strftime("%Y%m%d_%H%M%S")
+        report_run_dir = (
+            ROOT
+            / "logs"
+            / "report_dreamer_runtime"
+            / f"{report_run_id}_{dreamer_mode}_route_{route['id']}_seed_{seed}"
+        )
+        report_trace = report_run_dir / "trace.jsonl"
+        report_collision_events = report_run_dir / "collision_events.jsonl"
+        env.update(
+            {
+                "SIMLINGO_REPORT_DREAMER_MODE": report_profile["mode"],
+                "SIMLINGO_REPORT_DREAMER_ABLATION": report_profile["ablation"],
+                "SIMLINGO_REPORT_DREAMER_SHADOW": report_profile["shadow"],
+                "SIMLINGO_REPORT_DREAMER_CHECKPOINT": str(checkpoint),
+                "SIMLINGO_REPORT_DREAMER_CONFIG": str(
+                    ROOT / "configs" / "dreamer_report_aligned.yaml"
+                ),
+                "SIMLINGO_REPORT_DREAMER_DEVICE": str(
+                    payload.get("report_dreamer_device") or "cpu"
+                ),
+                "SIMLINGO_REPORT_DREAMER_TRACE": str(report_trace),
+                "SIMLINGO_COLLISION_EVENT_PATH": str(report_collision_events),
+                "SIMLINGO_REPORT_DREAMER_STATUS_PATH": env[
+                    "SIMLINGO_DREAMER_STATUS_PATH"
+                ],
+                "SIMLINGO_DREAMER_GUARD": "0",
+                "SIMLINGO_DREAMER_RUNTIME": "",
+                "SIMLINGO_DREAMER_RECOVERY": "0",
+                "SIMLINGO_DREAMER_COLLISION_SHIELD": "0",
+                "SIMLINGO_CARDREAMER_MODE": "off",
+            }
+        )
+        report_run_dir.mkdir(parents=True, exist_ok=True)
+        latest_report_trace = (
+            ROOT / "logs" / "simlingo_eval" / "latest_report_dreamer_trace.txt"
+        )
+        latest_report_trace.write_text(str(report_trace) + "\n", encoding="utf-8")
+    if dreamer_mode == "cardreamer_rssm_mirror":
+        try:
+            residual_alpha = float(payload.get("cardreamer_residual_alpha") or 0.35)
+        except (TypeError, ValueError):
+            raise ValueError("CarDreamer residual strength must be a number.")
+        if residual_alpha < 0.10 or residual_alpha > 0.75:
+            raise ValueError("CarDreamer residual strength must be between 0.10 and 0.75.")
+        env.update({
+            "SIMLINGO_CARDREAMER_MODE": "residual",
+            "SIMLINGO_CARDREAMER_LATERAL_ADAPTER": "mirror",
+            "SIMLINGO_CARDREAMER_RESIDUAL_ALPHA": f"{residual_alpha:.3f}",
+            "SIMLINGO_CARDREAMER_MAX_STEER_DELTA": str(payload.get("cardreamer_max_steer_delta") or "0.22"),
+            "SIMLINGO_CARDREAMER_MAX_STATUS_AGE": str(payload.get("cardreamer_max_status_age") or "6.0"),
+            "SIMLINGO_CARDREAMER_ENGAGE_DECISIONS": str(payload.get("cardreamer_engage_decisions") or "2"),
+            "SIMLINGO_CARDREAMER_MIN_ENGAGEMENT_DECISIONS": str(payload.get("cardreamer_min_engagement_decisions") or "20"),
+            "SIMLINGO_CARDREAMER_RELEASE_DECISIONS": str(payload.get("cardreamer_release_decisions") or "6"),
+            "SIMLINGO_CARDREAMER_MIN_ENGAGE_THROTTLE": str(payload.get("cardreamer_min_engage_throttle") or "0.15"),
+            "SIMLINGO_CARDREAMER_MIN_LATERAL_STEER": str(payload.get("cardreamer_min_lateral_steer") or "0.10"),
+            "SIMLINGO_CARDREAMER_TASK_SCOPED_AUTHORITY": "1",
+            "SIMLINGO_CARDREAMER_TRAFFIC_GATE": "1",
+            "SIMLINGO_CARDREAMER_MINIMUM_CLEARANCE": "5.0",
+            "SIMLINGO_CARDREAMER_MINIMUM_ONCOMING_TTC": "7.0",
+            "SIMLINGO_CARDREAMER_MINIMUM_REAR_TTC": "5.0",
+            "SIMLINGO_CARDREAMER_EMERGENCY_REAR_CLEARANCE": "3.0",
+            "SIMLINGO_CARDREAMER_EXPECTED_SHA256": "123525828488d596e80dad0fad0681767cec937adcc04bf0d5aa8ee972aa8058",
+            "SIMLINGO_DREAMER_GUARD": "0",
+            "SIMLINGO_DREAMER_RUNTIME": "",
+            "SIMLINGO_DREAMER_RECOVERY": "0",
+            "SIMLINGO_DREAMER_COLLISION_SHIELD": "0",
+        })
     if dreamer_mode in dreamer_presets:
         env.update(dreamer_presets[dreamer_mode])
-        if payload.get("dreamer_rl_training"):
+        training_requested = payload_enabled(payload.get("dreamer_rl_training"))
+        if dreamer_mode == "dreamer_ppo_rssm_v2" and training_requested:
+            raise ValueError(
+                "Dreamer PPO RSSM V2 is evaluation-only until its dedicated sequence updater is validated."
+            )
+        if training_requested:
             env["SIMLINGO_DREAMER_RL_TRAINING"] = "1"
             env["SIMLINGO_DREAMER_RL_DETERMINISTIC_EVAL"] = "0"
         if payload.get("dreamer_rl_action_space") and rl_kind_for_dreamer_mode(dreamer_mode) is None:
             env["SIMLINGO_DREAMER_RL_ACTION_SPACE"] = str(payload["dreamer_rl_action_space"])
+        learning_requested = payload_enabled(payload.get("dreamer_online_learning"))
+        checkpoint_role = str(payload.get("dreamer_checkpoint_role") or (
+            "candidate" if learning_requested else "production"
+        ))
         checkpoint_map = {
             "dreamer_ppo": {
                 "path": SIMLINGO_ROOT / "checkpoints" / "dreamer_guard" / "best_world_model.pt",
@@ -814,22 +1083,48 @@ def start_run(payload):
                 "help": "Dreamer SDBS checkpoint missing: external/simlingo/checkpoints/dreamer_sdbs_fresh/best_world_model.pt",
             },
             "dreamer_ppo_rl_noguard": {
-                "path": SIMLINGO_ROOT / "checkpoints" / "dreamer_ppo_rl_noguard" / "latest_rl_model.pt",
-                "source": "dreamer_ppo_rl_noguard",
-                "help": "Dreamer PPO RL no-guard checkpoint missing: external/simlingo/checkpoints/dreamer_ppo_rl_noguard/latest_rl_model.pt",
+                "path": checkpoint_for_rl_kind("ppo", checkpoint_role),
+                "source": f"dreamer_ppo_rl_noguard_{checkpoint_role}",
+                "help": f"Dreamer PPO RL no-guard {checkpoint_role} checkpoint is missing.",
             },
             "dreamer_sdbs_rl_noguard": {
-                "path": SIMLINGO_ROOT / "checkpoints" / "dreamer_sdbs_rl_noguard" / "latest_rl_model.pt",
-                "source": "dreamer_sdbs_rl_noguard",
-                "help": "Dreamer SDBS RL no-guard checkpoint missing: external/simlingo/checkpoints/dreamer_sdbs_rl_noguard/latest_rl_model.pt",
+                "path": checkpoint_for_rl_kind("sdbs", checkpoint_role),
+                "source": f"dreamer_sdbs_rl_noguard_{checkpoint_role}",
+                "help": f"Dreamer SDBS RL no-guard {checkpoint_role} checkpoint is missing.",
+            },
+            "dreamer_ppo_rssm_v2": {
+                "path": checkpoint_for_rssm_v2()[0],
+                "source": checkpoint_for_rssm_v2()[1],
+                "help": (
+                    "Dreamer PPO RSSM V2 has no validated candidate. Run "
+                    "scripts/train_dreamer_rssm_v2.py and inspect validation_report.json."
+                ),
             },
         }
         checkpoint_info = checkpoint_map.get(dreamer_mode, checkpoint_map["dreamer_ppo"])
         checkpoint = checkpoint_info["path"]
+        if payload.get("dreamer_checkpoint_path"):
+            override_allowed = (
+                rl_kind_for_dreamer_mode(dreamer_mode) is not None
+                or dreamer_mode == "dreamer_ppo_rssm_v2"
+            )
+            if not override_allowed:
+                raise ValueError(
+                    "A checkpoint override is only allowed for RL or RSSM Dreamer modes."
+                )
+            checkpoint = validated_checkpoint_override(payload["dreamer_checkpoint_path"])
+            checkpoint_info = {
+                **checkpoint_info,
+                "source": str(payload.get("dreamer_checkpoint_source") or "explicit_checkpoint_override"),
+            }
         if not checkpoint.exists():
             raise RuntimeError(checkpoint_info["help"])
         env["SIMLINGO_DREAMER_CHECKPOINT"] = str(checkpoint)
         env["SIMLINGO_DREAMER_CHECKPOINT_SOURCE"] = checkpoint_info["source"]
+        if payload.get("dreamer_rl_deterministic_eval") is not None:
+            env["SIMLINGO_DREAMER_RL_DETERMINISTIC_EVAL"] = (
+                "1" if payload_enabled(payload.get("dreamer_rl_deterministic_eval")) else "0"
+            )
     launch_script = "run_simlingo_with_pov.sh"
     if run_mode == "sumo_mirror":
         launch_script = "run_simlingo_with_sumo_mirror.sh"
@@ -852,6 +1147,22 @@ def start_run(payload):
             env["ACTION_DREAMING_RUN_ID"] = str(payload["action_dreaming_run_id"])
         if payload.get("action_dreaming_trace_path"):
             env["ACTION_DREAMING_TRACE_PATH"] = str(payload["action_dreaming_trace_path"])
+    elif run_mode == "report_native_collect":
+        if dreamer_mode != "off":
+            raise ValueError(
+                "Report Phase 1 collection requires Dreamer mode 'off' so the "
+                "dataset remains strictly native SimLingo."
+            )
+        launch_script = "run_report_dreamer_native_collect.sh"
+        env.update({
+            "SIMLINGO_REPORT_DREAMER_MODE": "off",
+            "SIMLINGO_REPORT_DREAMER_SHADOW": "0",
+            "SIMLINGO_DREAMER_GUARD": "0",
+            "SIMLINGO_DREAMER_RUNTIME": "",
+            "SIMLINGO_CARDREAMER_MODE": "off",
+            "SIMLINGO_RECORD": str(payload.get("record_video", "1")),
+            "SIMLINGO_PLAYBACK_AFTER": "0",
+        })
     if prompt_mode == "obstacle":
         env.update({
             "SIMLINGO_USER_FLAG": "1",
@@ -862,11 +1173,13 @@ def start_run(payload):
             ),
         })
     launch_log = LOG_DIR / "latest_launch.log"
-    env["SIMLINGO_VIEWER_LOG"] = str(ROOT / "logs" / "simlingo_eval" / "latest_pov_viewer.log")
+    env["SIMLINGO_VIEWER_LOG"] = str(
+        ROOT / "logs" / "simlingo_eval" / "latest_pov_viewer.log"
+    )
     online_rl_kind = rl_kind_for_dreamer_mode(dreamer_mode)
     online_rl_enabled = bool(
         online_rl_kind
-        and str(payload.get("dreamer_online_learning", "0")).lower() not in ("0", "false", "no", "off")
+        and payload_enabled(payload.get("dreamer_online_learning"))
     )
     online_rl_meta = None
     collector_proc = None
@@ -876,11 +1189,12 @@ def start_run(payload):
         run_id = time.strftime("%Y%m%d_%H%M%S")
         run_dir = ROOT / "logs" / "dreamer_online_rl" / f"webapp_{run_id}_{online_rl_kind}_route_{route['id']}_seed_{seed}"
         trace_path = run_dir / "trace.jsonl"
+        collision_events_path = run_dir / "collision_events.jsonl"
         backup_dir = run_dir / "checkpoint_backups"
-        checkpoint = checkpoint_for_rl_kind(online_rl_kind)
+        checkpoint = checkpoint_for_rl_kind(online_rl_kind, "candidate")
         backup_dir.mkdir(parents=True, exist_ok=True)
         if checkpoint.exists():
-            shutil.copy2(checkpoint, backup_dir / f"{online_rl_kind}_latest_rl_model_before_webapp_online.pt")
+            shutil.copy2(checkpoint, backup_dir / f"{online_rl_kind}_candidate_model_before_webapp_online.pt")
         env.update({
             "SIMLINGO_DREAMER_RL_TRAINING": "1",
             "SIMLINGO_DREAMER_RL_DETERMINISTIC_EVAL": "0",
@@ -889,6 +1203,7 @@ def start_run(payload):
             "ACTION_DREAMING_OUT_DIR": str(run_dir),
             "ACTION_DREAMING_RUN_ID": run_dir.name,
             "ACTION_DREAMING_TRACE_PATH": str(trace_path),
+            "SIMLINGO_COLLISION_EVENT_PATH": str(collision_events_path),
         })
         (ROOT / "logs" / "dreamer_online_rl" / "latest_training.txt").parent.mkdir(parents=True, exist_ok=True)
         (ROOT / "logs" / "dreamer_online_rl" / "latest_training.txt").write_text(str(run_dir) + "\n", encoding="utf-8")
@@ -902,6 +1217,7 @@ def start_run(payload):
             "scenario": route["scenario_type"],
             "seed": seed,
             "trace_path": str(trace_path),
+            "collision_events_path": str(collision_events_path),
             "checkpoint": str(checkpoint),
             "started_at": time.time(),
             "phase": "running_episode",
@@ -941,6 +1257,7 @@ def start_run(payload):
             "scenario": route["scenario_type"],
             "mode": run_mode,
             "dreamer_mode": dreamer_mode,
+            "report_checkpoint_role": report_checkpoint_role,
             "cot_mode": cot_mode,
             "seed": seed,
             "port": port,
@@ -965,7 +1282,14 @@ def start_run(payload):
             args=(proc, online_rl_meta, env["SIMLINGO_DREAMER_STATUS_PATH"]),
             daemon=True,
         ).start()
-    return {"ok": True, "route": route, "seed": seed}
+    return {
+        "ok": True,
+        "route": route,
+        "seed": seed,
+        "dreamer_mode": dreamer_mode,
+        "cot_mode": cot_mode,
+        "report_checkpoint_role": report_checkpoint_role,
+    }
 
 
 def replay_latest(payload):
@@ -1029,6 +1353,451 @@ def load_json_file(path):
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def read_key_value_file(path):
+    values = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+    except Exception:
+        pass
+    return values
+
+
+def _int_value(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _same_resolved_path(left, right):
+    try:
+        return Path(str(left)).expanduser().resolve() == Path(str(right)).expanduser().resolve()
+    except Exception:
+        return False
+
+
+def _report_training_service_state(unit_name):
+    try:
+        result = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                unit_name,
+                "--property=ActiveState",
+                "--property=SubState",
+                "--property=Result",
+                "--property=ExecMainStatus",
+                "--no-pager",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1.5,
+            check=False,
+        )
+        if result.returncode != 0:
+            return {}
+        return read_key_value_text(result.stdout)
+    except Exception:
+        return {}
+
+
+def read_key_value_text(text):
+    values = {}
+    for line in str(text or "").splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+    return values
+
+
+def _latest_matching_report_summary(root, candidate):
+    summaries = sorted(
+        (root / "logs" / "report_dreamer_campaigns").glob(
+            "**/closed_loop_ab_summary.json"
+        ),
+        key=lambda path: path.stat().st_mtime if path.exists() else 0.0,
+        reverse=True,
+    )
+    for path in summaries:
+        payload = load_json_file(path)
+        if payload and _same_resolved_path(payload.get("checkpoint"), candidate):
+            return path, payload
+    return None, None
+
+
+def _latest_matching_shadow_verification(root, candidate):
+    verifications = sorted(
+        (root / "logs" / "report_dreamer_runtime").glob(
+            "**/shadow_verification.json"
+        ),
+        key=lambda path: path.stat().st_mtime if path.exists() else 0.0,
+        reverse=True,
+    )
+    for path in verifications:
+        payload = load_json_file(path)
+        if not payload or payload.get("valid") is not True:
+            continue
+        trace_path = Path(str(payload.get("trace_path") or ""))
+        if not trace_path.is_file():
+            trace_path = path.with_name("trace.jsonl")
+        try:
+            first_line = next(
+                line for line in trace_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            )
+            trace_checkpoint = json.loads(first_line).get("checkpoint")
+        except Exception:
+            continue
+        if _same_resolved_path(trace_checkpoint, candidate):
+            return path, payload
+    return None, None
+
+
+def report_dreamer_pipeline_payload(root=ROOT, check_service=True):
+    """Return evidence-backed Report Dreamer lifecycle status for the webapp."""
+    root = Path(root)
+    matrix_id = REPORT_DREAMER_MATRIX_ID
+    matrix_dir = root / "data" / "report_dreamer" / "native" / "matrices" / matrix_id
+    collection_status = read_key_value_file(matrix_dir / "status.env")
+    collection_total = _int_value(collection_status.get("total"))
+    collection_accepted = _int_value(collection_status.get("accepted"))
+    collection_complete = bool(
+        collection_total > 0
+        and collection_accepted >= collection_total
+        and collection_status.get("state") == "complete"
+    )
+
+    audit_dir = (
+        root
+        / "checkpoints"
+        / "report_aligned_dreamer"
+        / ("audit_%s" % matrix_id)
+    )
+    audit = load_json_file(audit_dir / "dataset_audit.json") or {}
+    manifest = load_json_file(audit_dir / "dataset_manifest.json") or {}
+    split_names = ("train", "validation", "test")
+    split_counts = {
+        name: _int_value((manifest.get(name) or {}).get("episodes"))
+        for name in split_names
+    }
+    split_seeds = {
+        name: len((manifest.get("seed_sets") or {}).get(name) or [])
+        for name in split_names
+    }
+    transition_count = sum(
+        _int_value((manifest.get(name) or {}).get("transitions"))
+        for name in split_names
+    )
+    collision_labels = sum(
+        _int_value((manifest.get(name) or {}).get("collisions"))
+        for name in split_names
+    )
+    towns = sorted(
+        {
+            str(town)
+            for name in split_names
+            for town in ((manifest.get(name) or {}).get("towns") or [])
+        }
+    )
+    scenarios = sorted(
+        {
+            str(scenario)
+            for name in split_names
+            for scenario in ((manifest.get(name) or {}).get("scenarios") or [])
+        }
+    )
+    policy_sources = sorted(
+        {
+            str(source)
+            for name in split_names
+            for source in ((manifest.get(name) or {}).get("policy_sources") or [])
+        }
+    )
+    audit_complete = bool(
+        manifest
+        and audit.get("error") is None
+        and _int_value(audit.get("accepted")) >= 1
+        and all(split_counts[name] >= 2 for name in split_names)
+        and all(split_seeds[name] >= 2 for name in split_names)
+        and policy_sources == ["simlingo_native"]
+    )
+
+    candidate_dir = root / "checkpoints" / "report_aligned_dreamer" / "candidate"
+    candidate = candidate_dir / "report_dreamer_candidate.pt"
+    candidate_pairwise = candidate_dir / "pairwise_candidate.pt"
+    prediction_metrics_path = candidate_dir / "test_prediction_metrics.json"
+    production_dir = root / "checkpoints" / "report_aligned_dreamer" / "production"
+    production = production_dir / "report_dreamer.pt"
+    production_pairwise = production_dir / "report_dreamer_pairwise.pt"
+
+    training_log = (
+        root
+        / "logs"
+        / "report_aligned_dreamer"
+        / ("%s_training.log" % matrix_id)
+    )
+    log_text = ""
+    try:
+        log_text = training_log.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    world_epochs = [int(value) for value in re.findall(r"\[world-model\] epoch=(\d+)", log_text)]
+    policy_epochs = [int(value) for value in re.findall(r"\[policy\] epoch=(\d+)", log_text)]
+    world_epoch = max(world_epochs, default=0)
+    policy_epoch = max(policy_epochs, default=0)
+    training_config = (manifest.get("config") or {}).get("training") or {}
+    world_total = max(1, _int_value(training_config.get("world_model_epochs"), 30))
+    policy_total = max(1, _int_value(training_config.get("policy_epochs"), 30))
+    training_progress = min(
+        1.0, (min(world_epoch, world_total) + min(policy_epoch, policy_total))
+        / float(world_total + policy_total)
+    )
+    service = (
+        _report_training_service_state(REPORT_DREAMER_TRAINING_UNIT)
+        if check_service and root.resolve() == ROOT.resolve()
+        else {}
+    )
+    service_active = service.get("ActiveState") in ("active", "activating")
+    log_fresh = bool(
+        training_log.exists()
+        and time.time() - training_log.stat().st_mtime < 900
+        and not candidate.exists()
+        and (world_epoch or policy_epoch)
+    )
+    training_active = service_active or log_fresh
+    training_failed = bool(
+        service.get("ActiveState") == "failed"
+        or (
+            service.get("Result") not in (None, "", "success")
+            and service.get("ActiveState") == "inactive"
+        )
+    )
+    if candidate.exists():
+        training_state = "complete"
+        training_detail = "Candidate checkpoint composed; it is not promoted."
+    elif training_active:
+        training_state = "active"
+        training_detail = (
+            "Actor/critic epoch %d/%d" % (policy_epoch, policy_total)
+            if policy_epoch
+            else "World model epoch %d/%d" % (world_epoch, world_total)
+        )
+    elif training_failed:
+        training_state = "failed"
+        training_detail = "Training service stopped with an error; inspect the training log."
+    elif world_epoch or policy_epoch:
+        training_state = "paused"
+        training_detail = "Partial checkpoints exist, but no active training was detected."
+    else:
+        training_state = "blocked" if not audit_complete else "pending"
+        training_detail = "Waiting for a validated native-data audit."
+
+    prediction_metrics = load_json_file(prediction_metrics_path) or {}
+    evaluation_complete = bool(
+        prediction_metrics
+        and _same_resolved_path(prediction_metrics.get("checkpoint"), candidate)
+        and _int_value(prediction_metrics.get("test_seed_count")) >= 2
+    )
+    shadow_path, shadow = _latest_matching_shadow_verification(root, candidate)
+    shadow_complete = bool(shadow and shadow.get("valid") is True)
+    campaign_path, campaign = _latest_matching_report_summary(root, candidate)
+    campaign_complete = bool(
+        campaign
+        and campaign.get("complete") is True
+        and _int_value(campaign.get("paired_run_count")) >= 3
+    )
+    paired_count = _int_value((campaign or {}).get("paired_run_count"))
+    production_complete = production.is_file()
+
+    phases = [
+        {
+            "id": "collection",
+            "label": "Native collection",
+            "state": "complete" if collection_complete else (
+                "active" if collection_status.get("state") == "running" else "pending"
+            ),
+            "detail": "%d/%d routes accepted" % (collection_accepted, collection_total),
+            "progress": (
+                collection_accepted / float(collection_total)
+                if collection_total else 0.0
+            ),
+        },
+        {
+            "id": "audit",
+            "label": "Dataset audit",
+            "state": "complete" if audit_complete else (
+                "blocked" if not collection_complete else "pending"
+            ),
+            "detail": (
+                "%d transitions; split %d/%d/%d"
+                % (
+                    transition_count,
+                    split_counts["train"],
+                    split_counts["validation"],
+                    split_counts["test"],
+                )
+                if manifest else "Waiting for the finalized matrix"
+            ),
+            "progress": 1.0 if audit_complete else 0.0,
+        },
+        {
+            "id": "training",
+            "label": "RSSM + actor/critic",
+            "state": training_state,
+            "detail": training_detail,
+            "progress": 1.0 if candidate.exists() else training_progress,
+        },
+        {
+            "id": "evaluation",
+            "label": "Frozen test split",
+            "state": "complete" if evaluation_complete else (
+                "pending" if candidate.exists() else "blocked"
+            ),
+            "detail": (
+                "%d held-out seeds evaluated"
+                % _int_value(prediction_metrics.get("test_seed_count"))
+                if evaluation_complete else "Prediction losses, not a driving claim"
+            ),
+            "progress": 1.0 if evaluation_complete else 0.0,
+        },
+        {
+            "id": "shadow",
+            "label": "CARLA shadow",
+            "state": "complete" if shadow_complete else (
+                "pending" if evaluation_complete else "blocked"
+            ),
+            "detail": (
+                "%d inert-control ticks verified" % _int_value(shadow.get("ticks"))
+                if shadow_complete else "Requires alpha=0 and bit-exact native control"
+            ),
+            "progress": 1.0 if shadow_complete else 0.0,
+        },
+        {
+            "id": "paired",
+            "label": "Paired A/D CARLA",
+            "state": "complete" if campaign_complete else (
+                "active" if campaign and paired_count else (
+                    "pending" if shadow_complete else "blocked"
+                )
+            ),
+            "detail": (
+                "%d paired route/seed runs" % paired_count
+                if campaign else "Same routes, seeds and weather for A and D"
+            ),
+            "progress": min(1.0, paired_count / 3.0),
+        },
+        {
+            "id": "production",
+            "label": "Production promotion",
+            "state": "complete" if production_complete else (
+                "pending" if campaign_complete else "blocked"
+            ),
+            "detail": (
+                "Validated checkpoint available"
+                if production_complete
+                else "Needs score gain with no collision/off-road regression"
+            ),
+            "progress": 1.0 if production_complete else 0.0,
+        },
+    ]
+
+    if not collection_complete:
+        current_phase = "Native collection"
+        next_step = "Complete the native collection matrix before training."
+    elif not audit_complete:
+        current_phase = "Dataset audit"
+        next_step = "Resolve audit failures; never train on rejected or non-native traces."
+    elif not candidate.exists():
+        current_phase = "Offline training"
+        next_step = (
+            training_detail
+            if training_active
+            else "Resume the RSSM and imagined actor/critic training job."
+        )
+    elif not evaluation_complete:
+        current_phase = "Frozen evaluation"
+        next_step = "Evaluate the candidate once on the held-out test seeds."
+    elif not shadow_complete:
+        current_phase = "Shadow integration"
+        next_step = "Launch Report RSSM shadow with the candidate, then verify its trace."
+    elif not campaign_complete:
+        current_phase = "Paired closed loop"
+        next_step = "Run at least three paired native/candidate CARLA evaluations."
+    elif not production_complete:
+        current_phase = "Promotion gate"
+        next_step = "Run the strict promotion command; it will reject any safety regression."
+    else:
+        current_phase = "Production ready"
+        next_step = "Use the production role for reported closed-loop results."
+
+    weights = {
+        "collection": 0.15,
+        "audit": 0.10,
+        "training": 0.30,
+        "evaluation": 0.15,
+        "shadow": 0.10,
+        "paired": 0.15,
+        "production": 0.05,
+    }
+    overall_progress = sum(
+        weights[phase["id"]] * float(phase["progress"]) for phase in phases
+    )
+    return {
+        "protocol": "report_aligned_dreamer_v2",
+        "matrix_id": matrix_id,
+        "current_phase": current_phase,
+        "next_step": next_step,
+        "progress": round(100.0 * overall_progress, 1),
+        "phases": phases,
+        "dataset": {
+            "accepted_episodes": _int_value(audit.get("accepted")),
+            "rejected_traces": _int_value(audit.get("rejected")),
+            "transitions": transition_count,
+            "collisions": collision_labels,
+            "towns": towns,
+            "scenarios": scenarios,
+            "split": split_counts,
+            "native_only": policy_sources == ["simlingo_native"],
+        },
+        "training": {
+            "state": training_state,
+            "world_epoch": world_epoch,
+            "world_epochs_total": world_total,
+            "policy_epoch": policy_epoch,
+            "policy_epochs_total": policy_total,
+            "service": service,
+            "log": str(training_log),
+        },
+        "checkpoints": {
+            "candidate": {
+                "available": candidate.is_file(),
+                "pairwise_available": candidate.is_file() and candidate_pairwise.is_file(),
+                "path": str(candidate),
+                "status": "candidate_not_promoted" if candidate.is_file() else "missing",
+            },
+            "production": {
+                "available": production.is_file(),
+                "pairwise_available": production_pairwise.is_file(),
+                "path": str(production),
+                "status": "promoted" if production.is_file() else "missing",
+            },
+        },
+        "evidence": {
+            "audit_manifest": str(audit_dir / "dataset_manifest.json"),
+            "prediction_metrics": str(prediction_metrics_path),
+            "shadow_verification": str(shadow_path) if shadow_path else None,
+            "paired_summary": str(campaign_path) if campaign_path else None,
+        },
+    }
 
 
 def as_float(value, default=0.0):
@@ -1190,23 +1959,6 @@ def csv_kpi_for(label):
     return None
 
 
-SAFE_DREAM_ACTION_TAXONOMY = (
-    "base",
-    "model_nearby",
-    "model_cautious",
-    "model_steer_delta",
-    "hazard_hold",
-    "hazard_strong_hold",
-    "recovery_overtake",
-    "recovery_gap_commit",
-    "recovery_commit_continue",
-    "recovery_finish_pass",
-    "recovery_hold",
-    "recovery_creep",
-    "collision_shield_hold",
-)
-
-
 DREAMER_GROUP_DEFS = {
     "simlingo": {
         "id": "simlingo",
@@ -1233,11 +1985,65 @@ DREAMER_GROUP_DEFS = {
         "name": "SimLingo + SDBS RL no-guard",
         "subtitle": "Experimental SDBS RL checkpoint, no guard/shield/recovery filters",
     },
+    "dreamer_rssm": {
+        "id": "dreamer_rssm",
+        "name": "SimLingo + Dreamer RSSM",
+        "subtitle": "Experimental recurrent world model with learned five-step arbitration",
+    },
+    "cardreamer_rssm": {
+        "id": "cardreamer_rssm",
+        "name": "SimLingo + CarDreamer RSSM mirror",
+        "subtitle": "Official DreamerV3/RSSM overtake checkpoint with explicit traffic gate",
+    },
+    "report_rssm_shadow": {
+        "id": "report_rssm_shadow",
+        "name": "Report RSSM shadow",
+        "subtitle": "Read-only diagnostic; excluded from the primary closed-loop comparison",
+    },
+    "report_rssm_fixed": {
+        "id": "report_rssm_fixed",
+        "name": "C - SimLingo + RSSM fixed alpha",
+        "subtitle": "RSSM candidate imagination with fixed low authority",
+    },
+    "report_rssm_learned": {
+        "id": "report_rssm_learned",
+        "name": "D - SimLingo + RSSM learned alpha",
+        "subtitle": "Imagined actor-critic alternatives with continuous learned authority",
+    },
+    "report_rssm_pairwise": {
+        "id": "report_rssm_pairwise",
+        "name": "E - SimLingo + RSSM + pairwise",
+        "subtitle": "Learned authority plus separately trained pairwise calibrator",
+    },
 }
+
+
+def report_dreamer_group(ablation, shadow=False):
+    if shadow:
+        return "report_rssm_shadow"
+    return {
+        "C": "report_rssm_fixed",
+        "D": "report_rssm_learned",
+        "E": "report_rssm_pairwise",
+    }.get(str(ablation or "").upper(), "report_rssm_shadow")
 
 
 def dreamer_group_for_variant(variant, backend=""):
     text = f"{variant or ''} {backend or ''}".lower()
+    if "report_aligned_rssm_c" in text:
+        return "report_rssm_fixed"
+    if "report_aligned_rssm_d" in text:
+        return "report_rssm_learned"
+    if "report_aligned_rssm_e" in text:
+        return "report_rssm_pairwise"
+    if "report_aligned" in text:
+        return "report_rssm_shadow"
+    if "cardreamer" in text:
+        return "cardreamer_rssm"
+    # RSSM still uses the PPO actor, so identify it before the generic PPO/RL
+    # branches or its runs would silently contaminate the PPO no-guard column.
+    if "rssm" in text:
+        return "dreamer_rssm"
     if "sdbs_rl_noguard" in text:
         return "dreamer_sdbs_rl"
     if "ppo_rl_noguard" in text or "rl_noguard" in text:
@@ -1251,13 +2057,6 @@ def dreamer_group_for_variant(variant, backend=""):
     if text.strip() and text.strip() != "native":
         return "dreamer_ppo"
     return "native"
-
-
-def clamp01(value):
-    try:
-        return max(0.0, min(1.0, float(value)))
-    except Exception:
-        return None
 
 
 def fmt_score(value, digits=1):
@@ -1304,20 +2103,62 @@ def infraction_count(value):
     return as_float(value)
 
 
+def bench2drive_result_is_complete(data):
+    if not isinstance(data, dict):
+        return False
+    checkpoint = data.get("_checkpoint") or {}
+    records = checkpoint.get("records") or []
+    progress = checkpoint.get("progress") or []
+    if (
+        data.get("entry_status") != "Finished"
+        or data.get("eligible") is not True
+        or not isinstance(records, list)
+        or not records
+        or not isinstance(progress, list)
+        or len(progress) < 2
+    ):
+        return False
+    completed = int(as_float(progress[0], -1.0))
+    expected = int(as_float(progress[1], 0.0))
+    return bool(
+        expected > 0
+        and completed == expected
+        and all(
+            isinstance(record, dict) and record.get("status") == "Completed"
+            for record in records
+        )
+    )
+
+
 def parse_bench2drive_result(path):
     data = load_json_file(path)
-    if not data:
-        return None
-    if data.get("eligible") is False:
+    if not bench2drive_result_is_complete(data):
         return None
     checkpoint = data.get("_checkpoint", {})
     records = checkpoint.get("records") or []
     record = records[0] if records else checkpoint.get("global_record", {})
     global_record = checkpoint.get("global_record", {})
     scores = record.get("scores") or record.get("scores_mean") or global_record.get("scores_mean", {})
-    if not scores:
+    required_scores = ("score_route", "score_composed", "score_penalty")
+    if not isinstance(scores, dict) or any(key not in scores for key in required_scores):
         return None
     infractions = record.get("infractions") or global_record.get("infractions", {})
+    required_infractions = (
+        "collisions_pedestrian",
+        "collisions_vehicle",
+        "collisions_layout",
+        "red_light",
+        "stop_infraction",
+        "outside_route_lanes",
+        "vehicle_blocked",
+        "scenario_timeouts",
+        "route_timeout",
+        "min_speed_infractions",
+    )
+    if not isinstance(infractions, dict) or any(
+        key not in infractions for key in required_infractions
+    ):
+        return None
     meta = record.get("meta") or global_record.get("meta", {})
     length_m = as_float(meta.get("route_length"), as_float(meta.get("total_length"), 0.0))
     pedestrian_collisions = infraction_count(infractions.get("collisions_pedestrian"))
@@ -1331,8 +2172,20 @@ def parse_bench2drive_result(path):
     scenario_timeouts = infraction_count(infractions.get("scenario_timeouts"))
     route_timeouts = infraction_count(infractions.get("route_timeout"))
     min_speed = infraction_count(infractions.get("min_speed_infractions"))
-    route_score = as_float(scores.get("score_route"))
-    driving_score = as_float(scores.get("score_composed"))
+    collision_actor_ids = []
+    for key in ("collisions_vehicle", "collisions_pedestrian", "collisions_layout"):
+        values = infractions.get(key) or []
+        if not isinstance(values, list):
+            values = [values]
+        for value in values:
+            match = re.search(r"\bid=(\d+)\b", str(value))
+            if match:
+                collision_actor_ids.append(int(match.group(1)))
+    route_score = finite_number(scores.get("score_route"))
+    driving_score = finite_number(scores.get("score_composed"))
+    penalty = finite_number(scores.get("score_penalty"))
+    if route_score is None or driving_score is None or penalty is None:
+        return None
     return {
         "path": str(path),
         "route_label": result_key_from_path(path)[0] if result_key_from_path(path) else path.stem,
@@ -1342,11 +2195,12 @@ def parse_bench2drive_result(path):
         "length_km": max(0.0, length_m / 1000.0),
         "route_score": route_score,
         "driving_score": driving_score,
-        "penalty": as_float(scores.get("score_penalty")),
+        "penalty": penalty,
         "collisions": collisions,
         "pedestrian_collisions": pedestrian_collisions,
         "vehicle_collisions": vehicle_collisions,
         "layout_collisions": layout_collisions,
+        "first_collision_actor_id": collision_actor_ids[0] if collision_actor_ids else -1,
         "red_lights": red_lights,
         "stop_infractions": stop_infractions,
         "offroad": offroad,
@@ -1401,13 +2255,86 @@ def parse_dreamer_log(path):
         "kinds": set(),
         "candidate_ids": set(),
         "min_ttc": None,
+        "latencies_ms": [],
         "latest_step": None,
+        "report_trace_path": None,
     }
     if not path or not path.exists():
         return info
     try:
         with path.open("r", encoding="utf-8", errors="ignore") as handle:
             for line in handle:
+                if "SIMLINGO_REPORT_DREAMER enabled:" in line:
+                    fields = parse_guard_line(line)
+                    ablation = fields.get("ablation", "D").upper()
+                    shadow = fields.get("shadow") == "1"
+                    info["variant"] = "report_aligned_rssm_%s%s" % (
+                        ablation.lower(), "_shadow" if shadow else ""
+                    )
+                    info["group"] = report_dreamer_group(ablation, shadow)
+                    trace_path = fields.get("trace")
+                    if trace_path and trace_path != "-":
+                        candidate = Path(trace_path).expanduser()
+                        if not candidate.is_absolute():
+                            candidate = ROOT / candidate
+                        info["report_trace_path"] = candidate.resolve()
+                if "SIMLINGO_REPORT_DREAMER_PROFILE " in line:
+                    fields = parse_guard_line(line)
+                    ablation = fields.get("ablation", "D").upper()
+                    shadow = fields.get("shadow") == "1" or info.get("group") == "report_rssm_shadow"
+                    info["variant"] = "report_aligned_rssm_%s%s" % (
+                        ablation.lower(), "_shadow" if shadow else ""
+                    )
+                    info["group"] = report_dreamer_group(ablation, shadow)
+                    info["guard_rows"] += 1
+                    if fields.get("applied") == "1":
+                        info["applied"] += 1
+                    kind = fields.get("kind", "")
+                    if kind:
+                        info["kinds"].add(kind)
+                    candidate = fields.get("candidate")
+                    if candidate not in (None, "", "None"):
+                        info["candidate_ids"].add(candidate)
+                    if "step" in fields:
+                        info["latest_step"] = as_float(
+                            fields.get("step"), info.get("latest_step")
+                        )
+                    risk_pair = parse_arrow_pair(fields.get("risk", ""))
+                    if risk_pair and risk_pair[0] is not None and risk_pair[1] is not None:
+                        info["risk_deltas"].append(risk_pair[0] - risk_pair[1])
+                    progress_pair = parse_arrow_pair(fields.get("progress", ""))
+                    if progress_pair and progress_pair[0] is not None and progress_pair[1] is not None:
+                        info["progress_deltas"].append(progress_pair[1] - progress_pair[0])
+                    ttc = parse_ttc_value(fields.get("ttc"))
+                    if ttc is not None:
+                        info["min_ttc"] = ttc if info["min_ttc"] is None else min(info["min_ttc"], ttc)
+                    latency = as_float(fields.get("latency_ms"), None)
+                    if latency is not None:
+                        info["latencies_ms"].append(latency)
+                    continue
+                if "SIMLINGO_CARDREAMER_RESIDUAL:" in line:
+                    info["variant"] = "cardreamer_official_overtake_mirror_residual"
+                    info["group"] = "cardreamer_rssm"
+                if "SIMLINGO_CARDREAMER_PROFILE " in line:
+                    fields = parse_guard_line(line)
+                    info["variant"] = "cardreamer_official_overtake_mirror_residual"
+                    info["group"] = "cardreamer_rssm"
+                    info["guard_rows"] += 1
+                    if fields.get("applied") == "1":
+                        info["applied"] += 1
+                    kind = fields.get("kind", "")
+                    if kind and kind != "None":
+                        info["kinds"].add(kind)
+                    candidate = fields.get("candidate")
+                    if candidate not in (None, "", "None"):
+                        info["candidate_ids"].add(candidate)
+                    if "step" in fields:
+                        info["latest_step"] = as_float(fields.get("step"), info.get("latest_step"))
+                    for key in ("ttcL", "ttcR"):
+                        ttc = parse_ttc_value(fields.get(key))
+                        if ttc is not None:
+                            info["min_ttc"] = ttc if info["min_ttc"] is None else min(info["min_ttc"], ttc)
+                    continue
                 if "SIMLINGO_DREAMER_GUARD enabled" in line or "SIMLINGO_DREAMER_RL_NOGUARD enabled" in line:
                     fields = parse_guard_line(line)
                     variant = re.search(r"variant=([^\s]+)", line)
@@ -1471,6 +2398,120 @@ def mean_or_none(values):
     return sum(values) / len(values)
 
 
+def finite_number(value):
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def softmax_entropy(values):
+    finite = [finite_number(value) for value in values]
+    if not finite or any(value is None for value in finite):
+        return None
+    maximum = max(finite)
+    weights = [math.exp(value - maximum) for value in finite]
+    denominator = sum(weights)
+    if denominator <= 0.0 or not math.isfinite(denominator):
+        return None
+    probabilities = [weight / denominator for weight in weights]
+    return -sum(
+        probability * math.log(probability)
+        for probability in probabilities
+        if probability > 0.0
+    )
+
+
+def parse_report_trace_metrics(path):
+    """Return only metrics directly identifiable from report-RSSM traces."""
+    path = Path(path) if path else None
+    if path is None or not path.exists():
+        return None
+    candidate_counts = []
+    candidate_entropies = []
+    alphas = []
+    risk_deltas = []
+    progress_deltas = []
+    latencies_ms = []
+    ticks = 0
+    proposal_ticks = 0
+    intervention_ticks = 0
+    try:
+        with path.open("r", encoding="utf-8", errors="strict") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    continue
+                ticks += 1
+                features = row.get("candidate_features")
+                utilities = row.get("candidate_utilities")
+                if (
+                    isinstance(features, list)
+                    and features
+                    and isinstance(utilities, list)
+                    and len(features) == len(utilities)
+                ):
+                    entropy = softmax_entropy(utilities)
+                    if entropy is not None:
+                        candidate_counts.append(float(len(features)))
+                        candidate_entropies.append(entropy)
+                try:
+                    selected_index = int(row.get("selected_index", 0))
+                except (TypeError, ValueError):
+                    selected_index = 0
+                if selected_index != 0:
+                    proposal_ticks += 1
+                alpha = finite_number(row.get("alpha"))
+                if alpha is not None:
+                    alphas.append(alpha)
+                applied = bool(row.get("applied"))
+                if applied:
+                    intervention_ticks += 1
+                native_risk = finite_number(row.get("native_predicted_risk"))
+                selected_risk = finite_number(row.get("selected_predicted_risk"))
+                if native_risk is not None and selected_risk is not None:
+                    risk_deltas.append(native_risk - selected_risk)
+                native_progress = finite_number(row.get("native_predicted_progress"))
+                selected_progress = finite_number(row.get("selected_predicted_progress"))
+                if native_progress is not None and selected_progress is not None:
+                    progress_deltas.append(selected_progress - native_progress)
+                latency = finite_number(row.get("inference_latency_ms"))
+                if latency is not None:
+                    latencies_ms.append(latency)
+    except (OSError, ValueError, TypeError):
+        return None
+    if ticks == 0:
+        return None
+    return {
+        "path": str(path.resolve()),
+        "ticks": ticks,
+        "candidate_counts": candidate_counts,
+        "candidate_entropies": candidate_entropies,
+        "alphas": alphas,
+        "risk_deltas": risk_deltas,
+        "progress_deltas": progress_deltas,
+        "latencies_ms": latencies_ms,
+        "proposal_ticks": proposal_ticks,
+        "intervention_ticks": intervention_ticks,
+        "proposal_rate": proposal_ticks / ticks,
+        "intervention_rate": intervention_ticks / ticks,
+        "mean_candidates_per_decision": mean_or_none(candidate_counts),
+        "candidate_utility_entropy_nats": mean_or_none(candidate_entropies),
+        "predicted_risk_gain": mean_or_none(risk_deltas),
+        "predicted_progress_gain": mean_or_none(progress_deltas),
+        "alpha_mean": mean_or_none(alphas),
+        "inference_latency_ms_mean": mean_or_none(latencies_ms),
+        "unavailable_metrics": [
+            "dreaming_consistency",
+            "unsafe_future_rejection_rate",
+            "dreaming_quality_index",
+        ],
+    }
+
+
 def safe_dream_model_groups():
     groups = {key: dict(value) for key, value in DREAMER_GROUP_DEFS.items()}
     for group in groups.values():
@@ -1492,6 +2533,17 @@ def safe_dream_model_groups():
             "kinds": set(),
             "candidate_ids": set(),
             "min_ttc": None,
+            "latencies_ms": [],
+            "report_trace_paths": [],
+            "report_ticks": 0,
+            "report_proposal_ticks": 0,
+            "report_intervention_ticks": 0,
+            "report_candidate_counts": [],
+            "report_candidate_entropies": [],
+            "report_alphas": [],
+            "report_risk_deltas": [],
+            "report_progress_deltas": [],
+            "report_latencies_ms": [],
             "latest_result": None,
         })
 
@@ -1533,6 +2585,18 @@ def safe_dream_model_groups():
         group["runs"].append(result)
         if log_path:
             group["logs"].append(str(log_path))
+        report_trace = parse_report_trace_metrics(log_info.get("report_trace_path"))
+        if report_trace is not None:
+            group["report_trace_paths"].append(report_trace["path"])
+            group["report_ticks"] += report_trace["ticks"]
+            group["report_proposal_ticks"] += report_trace["proposal_ticks"]
+            group["report_intervention_ticks"] += report_trace["intervention_ticks"]
+            group["report_candidate_counts"].extend(report_trace["candidate_counts"])
+            group["report_candidate_entropies"].extend(report_trace["candidate_entropies"])
+            group["report_alphas"].extend(report_trace["alphas"])
+            group["report_risk_deltas"].extend(report_trace["risk_deltas"])
+            group["report_progress_deltas"].extend(report_trace["progress_deltas"])
+            group["report_latencies_ms"].extend(report_trace["latencies_ms"])
         group["guard_rows"] += log_info["guard_rows"]
         group["applied"] += log_info["applied"]
         group["shield"] += log_info["shield"]
@@ -1543,6 +2607,7 @@ def safe_dream_model_groups():
         group["progress_deltas"].extend(log_info["progress_deltas"])
         group["kinds"].update(log_info["kinds"])
         group["candidate_ids"].update(log_info["candidate_ids"])
+        group["latencies_ms"].extend(log_info.get("latencies_ms", []))
         if log_info["min_ttc"] is not None:
             group["min_ttc"] = log_info["min_ttc"] if group["min_ttc"] is None else min(group["min_ttc"], log_info["min_ttc"])
         group["latest_result"] = result
@@ -1559,6 +2624,27 @@ def safe_dream_model_groups():
         route_timeouts = sum(r["route_timeouts"] for r in runs)
         scenario_timeouts = sum(r["scenario_timeouts"] for r in runs)
         min_speed = sum(r["min_speed_infractions"] for r in runs)
+        has_report_trace = group["report_ticks"] > 0
+        if has_report_trace:
+            override_rate = (
+                group["report_intervention_ticks"] / group["report_ticks"]
+            )
+            proposal_rate = group["report_proposal_ticks"] / group["report_ticks"]
+            safety_gain = mean_or_none(group["report_risk_deltas"])
+            progress_gain = mean_or_none(group["report_progress_deltas"])
+            avg_latency = mean_or_none(group["report_latencies_ms"])
+            alpha_mean = mean_or_none(group["report_alphas"])
+        else:
+            override_rate = (
+                group["applied"] / group["guard_rows"]
+                if group["guard_rows"]
+                else None
+            )
+            proposal_rate = None
+            safety_gain = mean_or_none(group["risk_deltas"])
+            progress_gain = mean_or_none(group["progress_deltas"])
+            avg_latency = mean_or_none(group["latencies_ms"])
+            alpha_mean = None
         group.update({
             "n": n,
             "trace_run_count": len(group["trace_logs"]),
@@ -1577,22 +2663,22 @@ def safe_dream_model_groups():
             "min_speed_per_ep": min_speed / n if n else None,
             "traffic_rule_pass_rate": mean_or_none([1.0 if (r["red_lights"] + r["stop_infractions"]) == 0 else 0.0 for r in runs]),
             "blocked_pass_rate": mean_or_none([1.0 if r["blocked"] == 0 else 0.0 for r in runs]),
-            "override_rate": group["applied"] / group["guard_rows"] if group["guard_rows"] else None,
-            "safety_gain": mean_or_none(group["risk_deltas"]),
-            "progress_gain": mean_or_none(group["progress_deltas"]),
+            "override_rate": override_rate,
+            "proposal_rate": proposal_rate,
+            "alpha_mean": alpha_mean,
+            "safety_gain": safety_gain,
+            "progress_gain": progress_gain,
+            "avg_inference_latency_ms": avg_latency,
         })
-        if group["guard_rows"]:
-            cc = min(1.0, len(group["kinds"]) / max(1, len(SAFE_DREAM_ACTION_TAXONOMY)))
-            fd = min(1.0, len(group["candidate_ids"]) / 8.0)
-            dc = clamp01(1.0 - ((collisions + offroad) / max(1, n)))
-            unsafe_total = group["shield"] + collisions + offroad
-            ufrr = group["shield"] / unsafe_total if unsafe_total > 0 else None
-            sg_norm = clamp01(max(0.0, group["safety_gain"] or 0.0) / 0.20)
-            dqi_terms = [term for term in (cc, fd, dc, ufrr, sg_norm) if term is not None]
-            dqi = sum(dqi_terms) / len(dqi_terms) if dqi_terms else None
-        else:
-            cc = fd = ufrr = sg_norm = dqi = None
-            dc = clamp01(1.0 - ((collisions + offroad) / max(1, n))) if n else None
+        # Only report metrics that are directly identifiable from candidate
+        # rollouts. Consistency, unsafe rejection and DQI require synchronized
+        # outcome/rejection labels that the current runtime trace does not have.
+        cc = mean_or_none(group["report_candidate_counts"])
+        fd = mean_or_none(group["report_candidate_entropies"])
+        dc = None
+        ufrr = None
+        sg_norm = None
+        dqi = None
         group.update({
             "counterfactual_coverage": cc,
             "future_diversity": fd,
@@ -1600,6 +2686,11 @@ def safe_dream_model_groups():
             "unsafe_rejection_rate": ufrr,
             "safety_gain_norm": sg_norm,
             "dreaming_quality_index": dqi,
+            "safe_dream_missing_evidence": [
+                "synchronized observed outcomes for dreaming consistency",
+                "explicit unsafe-candidate labels and rejection decisions for UFRR",
+                "all validated DQI components under one frozen protocol",
+            ],
         })
     return groups
 
@@ -1609,9 +2700,9 @@ def dreamer_comparison_payload():
     comparison_keys = [
         "simlingo",
         "dreamer_ppo",
-        "dreamer_sdbs",
-        "dreamer_ppo_rl",
-        "dreamer_sdbs_rl",
+        "report_rssm_fixed",
+        "report_rssm_learned",
+        "report_rssm_pairwise",
     ]
     wm = load_json_file(DREAMER_ROOT / "outputs" / "simlingo_world_model_20260616" / "summary.json") or {}
     guard = load_json_file(DREAMER_ROOT / "outputs" / "simlingo_dreamer_guard_rm005_md005" / "summary.json") or {}
@@ -1620,8 +2711,23 @@ def dreamer_comparison_payload():
     sdbs_summary = load_json_file(SIMLINGO_ROOT / "checkpoints" / "dreamer_sdbs_fresh" / "summary.json") or {}
     sdbs_manifest = SIMLINGO_ROOT / "checkpoints" / "dreamer_sdbs_fresh" / "manifest.txt"
     sdbs_checkpoint = SIMLINGO_ROOT / "checkpoints" / "dreamer_sdbs_fresh" / "best_world_model.pt"
-    ppo_rl_checkpoint = SIMLINGO_ROOT / "checkpoints" / "dreamer_ppo_rl_noguard" / "latest_rl_model.pt"
-    sdbs_rl_checkpoint = SIMLINGO_ROOT / "checkpoints" / "dreamer_sdbs_rl_noguard" / "latest_rl_model.pt"
+    cardreamer_checkpoint = (
+        ROOT
+        / "external"
+        / "cardreamer_checkpoints"
+        / "CarDreamer_checkpoints"
+        / "overtake.ckpt"
+    )
+    report_checkpoint = (
+        ROOT
+        / "checkpoints"
+        / "report_aligned_dreamer"
+        / "production"
+        / "report_dreamer.pt"
+    )
+    report_pairwise_checkpoint = report_checkpoint.with_name(
+        "report_dreamer_pairwise.pt"
+    )
 
     wm_best = wm.get("best", {})
     legacy_guard_override = guard.get("override_rate")
@@ -1640,8 +2746,15 @@ def dreamer_comparison_payload():
             {"label": "Route completion", "value": fmt_score(group["avg_route"])},
             {"label": "Success rate", "value": fmt_percent(group["success_rate"])},
             {"label": "Collision rate / Mkm", "value": fmt_rate(group["collision_rate_mkm"])},
-            {"label": "Override rate", "value": fmt_percent(group["override_rate"])},
-            {"label": "SAFE-DREAM DQI", "value": fmt_ratio(group["dreaming_quality_index"])},
+            {"label": "Observed intervention rate", "value": fmt_percent(group["override_rate"])},
+            {
+                "label": "SAFE-DREAM DQI",
+                "value": (
+                    fmt_ratio(group["dreaming_quality_index"])
+                    if group["dreaming_quality_index"] is not None
+                    else "N/A"
+                ),
+            },
         ]
         if latest:
             metrics.extend([
@@ -1652,13 +2765,24 @@ def dreamer_comparison_payload():
         status = "reference" if key == "simlingo" else "active"
         if key == "dreamer_sdbs" and not sdbs_checkpoint.exists():
             status = "needs training"
-        if key == "dreamer_ppo_rl":
-            status = "rl no-guard" if ppo_rl_checkpoint.exists() else "needs training"
-        if key == "dreamer_sdbs_rl":
-            status = "rl no-guard" if sdbs_rl_checkpoint.exists() else "needs training"
+        if key == "cardreamer_rssm":
+            status = "active experimental" if cardreamer_checkpoint.exists() else "checkpoint missing"
+        if key in ("report_rssm_fixed", "report_rssm_learned"):
+            status = "active" if report_checkpoint.exists() else "awaiting promotion"
+        if key == "report_rssm_pairwise":
+            status = (
+                "active"
+                if report_pairwise_checkpoint.exists()
+                else "pairwise checkpoint missing"
+            )
         note = checkpoint_note or "Computed from local Bench2Drive JSON results and matching run logs."
         if group.get("incomplete_result_count"):
             note += f" {group['incomplete_result_count']} trace run(s) detected but not counted because Bench2Drive did not write eligible scores."
+        if key.startswith("report_rssm_"):
+            note += (
+                " DC, UFRR and DQI remain N/A until synchronized observed-outcome "
+                "and explicit unsafe-candidate rejection labels exist."
+            )
         if group["latest_result"]:
             note += f" Latest: {Path(group['latest_result']['path']).name}."
         return {
@@ -1677,26 +2801,21 @@ def dreamer_comparison_payload():
 
     cards = [
         card_for("simlingo", "Native baseline: no Dreamer/guard intervention, only Bench2Drive closed-loop metrics."),
-        card_for("dreamer_ppo", "Runtime guard/recovery/shield enabled. Legacy offline override rate: " + fmt_percent(legacy_guard_override) + "."),
         card_for(
-            "dreamer_sdbs",
-            (
-                "Runtime guard/recovery/shield enabled. SDBS checkpoint installed; "
-                if sdbs_checkpoint.exists() else "Runtime guard/recovery/shield enabled. SDBS checkpoint missing; "
-            )
-            + f"state={sdbs_summary.get('state_dim', 28)}D, transitions={sdbs_summary.get('transitions', '-')}, best_loss={fmt_number((sdbs_summary.get('best') or {}).get('loss'), 4)}.",
+            "dreamer_ppo",
+            "Guarded complement: SimLingo drives by default; unified Dreamer PPO guard/recovery intervenes when selected.",
         ),
         card_for(
-            "dreamer_ppo_rl",
-            "No guard runtime: guard=0, recovery=0, collision_shield=0. Uses latest PPO RL checkpoint."
-            if ppo_rl_checkpoint.exists()
-            else "No guard runtime slot. Missing latest PPO RL checkpoint.",
+            "report_rssm_fixed",
+            "Ablation C: compact RSSM imagination around candidate 0 (native SimLingo) with a fixed, low alpha.",
         ),
         card_for(
-            "dreamer_sdbs_rl",
-            "No guard runtime: guard=0, recovery=0, collision_shield=0. Uses latest SDBS RL checkpoint."
-            if sdbs_rl_checkpoint.exists()
-            else "No guard runtime slot. Missing latest SDBS RL checkpoint.",
+            "report_rssm_learned",
+            "Ablation D: imagined actor/critic alternatives and continuous learned authority over native SimLingo.",
+        ),
+        card_for(
+            "report_rssm_pairwise",
+            "Ablation E: D plus a separately trained pairwise calibrator with seed-disjoint train/validation/test splits.",
         ),
     ]
 
@@ -1721,13 +2840,16 @@ def dreamer_comparison_payload():
         row("Family E Eq.17 - Agent-blocked pass rate", "blocked_pass_rate", fmt_percent),
         row("Family E - Min-speed infractions / episode", "min_speed_per_ep", fmt_rate),
         row("Family E Eq.13 - Min TTC observed in Dreamer log", "min_ttc", lambda v: "-" if v is None else f"{float(v):.2f}s"),
-        row("Runtime - Dreamer override rate", "override_rate", fmt_percent),
-        row("Family D Eq.4 - Counterfactual coverage CC", "counterfactual_coverage", fmt_ratio),
-        row("Family D Eq.5 - Future diversity FD proxy", "future_diversity", fmt_ratio),
-        row("Family D Eq.6 - Dreaming consistency DC proxy", "dreaming_consistency", fmt_ratio),
-        row("Family D Eq.9 - Unsafe future rejection UFRR proxy", "unsafe_rejection_rate", fmt_ratio),
-        row("Family D Eq.10 - Safety gain SG risk delta", "safety_gain", fmt_number),
-        row("Family D Eq.11 - Dreaming Quality Index DQI", "dreaming_quality_index", fmt_ratio),
+        row("Runtime - Dreamer proposal rate", "proposal_rate", fmt_percent),
+        row("Runtime - Observed intervention rate", "override_rate", fmt_percent),
+        row("Runtime - Mean continuous alpha", "alpha_mean", fmt_ratio),
+        row("Runtime - Mean RSSM inference latency", "avg_inference_latency_ms", lambda v: "-" if v is None else f"{float(v):.2f} ms"),
+        row("Family D - Mean imagined candidates / decision", "counterfactual_coverage", fmt_ratio),
+        row("Family D - Candidate utility entropy (nats)", "future_diversity", fmt_ratio),
+        row("Family D - Dreaming consistency (ground truth unavailable)", "dreaming_consistency", lambda v: "N/A"),
+        row("Family D - Unsafe future rejection (labels unavailable)", "unsafe_rejection_rate", lambda v: "N/A"),
+        row("Family D - Predicted risk gain (not observed safety)", "safety_gain", fmt_number),
+        row("Family D - DQI (required components unavailable)", "dreaming_quality_index", lambda v: "N/A"),
         {
             "label": "Evidence - Latest result file",
             "values": {
@@ -1751,11 +2873,12 @@ def dreamer_comparison_payload():
         "columns": [{"id": key, "label": groups[key]["name"]} for key in comparison_keys],
         "source": "SAFE-DREAM dashboard adapter over local Bench2Drive result JSONs and SimLingo/Dreamer run logs",
         "runme_kpis": [
+            "The table implements report ablations A-E: native SimLingo, preserved legacy guarded Dreamer, fixed-alpha RSSM, learned-authority RSSM, and optional pairwise calibration.",
             "Family E metrics are direct Bench2Drive outcomes: driving score, route completion, collisions, off-road, traffic-rule and blocked-agent rates.",
-            "Family D metrics are derived from Dreamer traces: CC from observed candidate kinds, FD from candidate diversity, SG from base-risk minus chosen-risk, and UFRR from shielded unsafe futures.",
-            "RL no-guard columns are runtime no-guard modes: SIMLINGO_DREAMER_GUARD=0, recovery=0, collision_shield=0, logged as SIMLINGO_DREAMER_RL_NOGUARD.",
-            "Metrics marked as proxy are valid for comparison inside this pipeline but should be reported as log-derived SAFE-DREAM proxies, not full rollout-ground-truth measurements.",
-            "Legacy PPO offline summary: override " + fmt_percent(legacy_guard_override) + ", loose override " + fmt_percent(legacy_loose_override) + ", candidate agreement " + fmt_percent(pure_agreement) + ", WM loss " + fmt_number(wm_best.get("loss"), 4) + ".",
+            "Directly identifiable Family D runtime evidence is limited to mean candidates per decision, candidate-utility entropy, proposal/intervention rates, alpha, latency and model-predicted risk/progress deltas.",
+            "CarDreamer is used only as an attributed technical reference for RSSM/Dreamer mechanisms; this branch consumes the compact report-defined CARLA/SimLingo observation, not privileged BEV input.",
+            "Shadow runs are intentionally excluded from closed-loop C/D/E columns because alpha is forced to zero and their driving outcome is native SimLingo.",
+            "Dreaming consistency, unsafe-future rejection and DQI are N/A until synchronized observed outcomes and explicit unsafe-candidate labels are collected; they are never inferred from collisions or candidate names.",
         ],
         "all_runs": [
             {
@@ -1768,7 +2891,13 @@ def dreamer_comparison_payload():
         "cards": cards,
         "rows": rows,
         "raw": {
-            key: {k: v for k, v in groups[key].items() if k not in ("runs", "logs", "variants", "kinds", "candidate_ids", "risk_deltas", "progress_deltas")}
+            key: {k: v for k, v in groups[key].items() if k not in (
+                "runs", "logs", "variants", "kinds", "candidate_ids",
+                "risk_deltas", "progress_deltas", "latencies_ms",
+                "report_candidate_counts", "report_candidate_entropies",
+                "report_alphas", "report_risk_deltas",
+                "report_progress_deltas", "report_latencies_ms",
+            )}
             for key in comparison_keys
         },
     }
@@ -2019,6 +3148,24 @@ HTML = r"""<!doctype html>
     }
     select:focus, input:focus { border-color: rgba(110,231,249,.82); background: rgba(5,7,10,.78); }
     input:disabled { color: rgba(245,247,251,.44); }
+    .seed-control {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 72px;
+      gap: 8px;
+      min-width: 0;
+    }
+    .seed-new {
+      height: 46px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 0 10px;
+      color: var(--ink);
+      background: rgba(255,255,255,.075);
+      cursor: pointer;
+      font-weight: 900;
+      letter-spacing: 0;
+    }
+    .seed-new:hover { border-color: rgba(110,231,249,.72); background: rgba(110,231,249,.10); }
     .route-strip {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -2074,6 +3221,28 @@ HTML = r"""<!doctype html>
     }
     .go:hover, .ghost:hover { transform: translateY(-2px); filter: brightness(1.06); }
     .go:active, .ghost:active { transform: translateY(1px); }
+    .go:disabled, .ghost:disabled {
+      cursor: not-allowed;
+      opacity: .48;
+      transform: none;
+      filter: grayscale(.35);
+      box-shadow: none;
+    }
+    .readonly-banner {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-top: 14px;
+      padding: 12px 16px;
+      border: 1px solid rgba(110,231,249,.32);
+      border-radius: 8px;
+      color: rgba(245,247,251,.86);
+      background: rgba(110,231,249,.08);
+      font-size: .88rem;
+    }
+    .readonly-banner strong { color: var(--cyan); }
+    body.readonly .readonly-banner { display: flex; }
     .status {
       margin-top: 12px;
       min-height: 58px;
@@ -2130,6 +3299,182 @@ HTML = r"""<!doctype html>
       backdrop-filter: blur(18px);
       box-shadow: 0 24px 70px rgba(0,0,0,.26);
       overflow: hidden;
+    }
+    .pipeline-panel {
+      margin-top: 22px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(12,17,27,.78);
+      box-shadow: 0 24px 70px rgba(0,0,0,.24);
+      overflow: hidden;
+    }
+    .pipeline-overview {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(300px, .58fr);
+      gap: 18px;
+      padding: 18px;
+      border-bottom: 1px solid var(--line-soft);
+      align-items: end;
+    }
+    .pipeline-stage { min-width: 0; }
+    .pipeline-stage span,
+    .pipeline-fact span,
+    .pipeline-next span {
+      display: block;
+      color: var(--muted);
+      font-size: .72rem;
+      font-weight: 900;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .pipeline-stage strong {
+      display: block;
+      margin-top: 7px;
+      color: var(--cyan);
+      font-size: clamp(1.28rem, 2.2vw, 1.9rem);
+      line-height: 1.12;
+      overflow-wrap: anywhere;
+    }
+    .pipeline-stage p {
+      margin: 8px 0 0;
+      color: rgba(245,247,251,.68);
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+    .pipeline-progress-block { min-width: 0; }
+    .pipeline-progress-meta {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 12px;
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-size: .78rem;
+      font-weight: 850;
+    }
+    .pipeline-progress-meta strong {
+      color: var(--ink);
+      font-size: 1.05rem;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .pipeline-track {
+      height: 12px;
+      border: 1px solid var(--line-soft);
+      border-radius: 6px;
+      background: rgba(5,7,10,.72);
+      overflow: hidden;
+    }
+    .pipeline-fill {
+      width: 0;
+      height: 100%;
+      background: linear-gradient(90deg, var(--cyan), var(--green));
+      transition: width .35s ease;
+    }
+    .pipeline-facts {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .pipeline-fact {
+      min-width: 0;
+      border-left: 2px solid rgba(110,231,249,.42);
+      padding-left: 9px;
+    }
+    .pipeline-fact strong {
+      display: block;
+      margin-top: 5px;
+      font-size: .9rem;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+    }
+    .pipeline-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+      gap: 10px;
+      padding: 14px;
+    }
+    .pipeline-step {
+      min-width: 0;
+      min-height: 142px;
+      padding: 13px;
+      border: 1px solid var(--line-soft);
+      border-radius: 8px;
+      background: rgba(5,7,10,.36);
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+      gap: 10px;
+      align-content: start;
+    }
+    .pipeline-step-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 9px;
+      min-width: 0;
+    }
+    .pipeline-step h4 {
+      min-width: 0;
+      margin: 0;
+      font-size: .9rem;
+      line-height: 1.3;
+      overflow-wrap: anywhere;
+    }
+    .pipeline-state {
+      flex: 0 0 auto;
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 3px 7px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--muted);
+      background: rgba(255,255,255,.045);
+      font-size: .65rem;
+      font-weight: 950;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+    .pipeline-step.complete { border-color: rgba(126,242,162,.30); }
+    .pipeline-step.complete .pipeline-state { color: var(--green); border-color: rgba(126,242,162,.35); background: rgba(126,242,162,.08); }
+    .pipeline-step.active { border-color: rgba(110,231,249,.40); }
+    .pipeline-step.active .pipeline-state { color: var(--cyan); border-color: rgba(110,231,249,.45); background: rgba(110,231,249,.09); }
+    .pipeline-step.failed .pipeline-state { color: var(--red); border-color: rgba(255,93,115,.42); background: rgba(255,93,115,.09); }
+    .pipeline-step.paused .pipeline-state,
+    .pipeline-step.pending .pipeline-state { color: var(--amber); border-color: rgba(255,209,102,.35); background: rgba(255,209,102,.08); }
+    .pipeline-mini-track {
+      height: 5px;
+      border-radius: 3px;
+      overflow: hidden;
+      background: rgba(255,255,255,.07);
+    }
+    .pipeline-mini-track i {
+      display: block;
+      width: 0;
+      height: 100%;
+      background: var(--cyan);
+    }
+    .pipeline-step p {
+      margin: 0;
+      color: rgba(245,247,251,.62);
+      font-size: .78rem;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+    .pipeline-next {
+      margin: 0 14px 14px;
+      padding: 13px 14px;
+      border: 1px solid rgba(110,231,249,.22);
+      border-radius: 8px;
+      background: rgba(110,231,249,.055);
+    }
+    .pipeline-next strong {
+      display: block;
+      margin-top: 6px;
+      font-size: .92rem;
+      line-height: 1.4;
+      overflow-wrap: anywhere;
     }
     .compare-head {
       display: flex;
@@ -2239,7 +3584,7 @@ HTML = r"""<!doctype html>
     .kpi-table-wrap { padding: 0 14px 14px; overflow-x: auto; }
     .kpi-table {
       width: 100%;
-      min-width: 1260px;
+      min-width: 1040px;
       border-collapse: collapse;
       overflow: hidden;
       border-radius: 8px;
@@ -2346,6 +3691,7 @@ HTML = r"""<!doctype html>
       .hero, .world-bands { grid-template-columns: 1fr; }
       .launch-pad { min-height: auto; }
       .telemetry { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .pipeline-overview { grid-template-columns: 1fr; align-items: start; }
       .compare-grid { grid-template-columns: 1fr; }
       .observed-runs { grid-template-columns: 1fr; }
     }
@@ -2355,6 +3701,9 @@ HTML = r"""<!doctype html>
       .hero { padding-top: 14px; }
       .world { min-height: 460px; }
       .split, .tri, .route-strip, .main-actions, .action-row, .telemetry { grid-template-columns: 1fr; }
+      .pipeline-facts { grid-template-columns: 1fr; }
+      .compare-head { flex-direction: column; }
+      .compare-refresh { width: 100%; }
       h1 { font-size: clamp(2.4rem, 15vw, 4.4rem); }
     }
   </style>
@@ -2369,6 +3718,10 @@ HTML = r"""<!doctype html>
       </div>
       <div class="live"><span class="live-dot"></span><span id="topStatus">idle</span></div>
     </nav>
+    <div class="readonly-banner" id="readOnlyBanner">
+      <strong>Presentation mode</strong>
+      <span>Read-only dashboard: configuration and KPIs are visible, execution controls are locked server-side.</span>
+    </div>
 
     <section class="hero">
       <div class="world" id="world">
@@ -2410,6 +3763,7 @@ HTML = r"""<!doctype html>
             <label>Launch mode<select id="run_mode">
               <option value="sumo_mirror">CARLA POV + SUMO mirror</option>
               <option value="action_dreaming">CARLA POV + Action Dreaming collect</option>
+              <option value="report_native_collect">Report Phase 1 - native SimLingo collect</option>
               <option value="pov">CARLA POV only</option>
             </select></label>
             <label>SUMO GUI<select id="sumo_mirror_gui">
@@ -2417,22 +3771,21 @@ HTML = r"""<!doctype html>
               <option value="0">Headless mirror logs</option>
             </select></label>
           </div>
-          <div class="split">
-            <label>Dreamer mode<select id="dreamer_mode">
-              <option value="off">Off - native SimLingo</option>
-              <option value="dreamer_ppo">Dreamer PPO</option>
-              <option value="dreamer_sdbs">Dreamer SDBS</option>
-              <option value="dreamer_ppo_rl_noguard">Dreamer PPO RL no-guard</option>
-              <option value="dreamer_sdbs_rl_noguard">Dreamer SDBS RL no-guard</option>
-            </select></label>
-            <label>Dreamer overlay<input type="text" value="Pygame live panel + replay" disabled></label>
-          </div>
+          <label>Dreamer mode<select id="dreamer_mode">
+            <option value="off">Off - native SimLingo</option>
+            <option value="dreamer_ppo">Dreamer PPO</option>
+            <option value="report_rssm_learned">Dreamer RSSM D - learned alpha</option>
+          </select></label>
+          <input id="cardreamer_strength" type="hidden" value="0.35">
           <div class="split">
             <label>RL update<select id="dreamer_online_learning">
               <option value="0">Off - run only</option>
               <option value="1">Training session</option>
             </select></label>
-            <label>Dreamer role<input type="text" value="Learned blend with SimLingo" disabled></label>
+            <label>Report checkpoint<select id="report_checkpoint_role" disabled>
+              <option value="candidate" selected>Candidate - validation only</option>
+              <option value="production">Production - promoted only</option>
+            </select></label>
           </div>
           <div class="split">
             <label>External CoT<select id="cot_mode">
@@ -2447,7 +3800,10 @@ HTML = r"""<!doctype html>
             </select></label>
           </div>
           <div class="split">
-            <label>Seed<input id="seed" type="number" min="1" placeholder="random"></label>
+            <label>Experiment seed<span class="seed-control">
+              <input id="seed" type="number" min="1" max="999999999" inputmode="numeric">
+              <button class="seed-new" id="new_seed" type="button">New</button>
+            </span></label>
             <label>CARLA quality<select id="quality"><option>Epic</option><option>Low</option></select></label>
           </div>
           <div class="split">
@@ -2536,11 +3892,47 @@ HTML = r"""<!doctype html>
       </div>
     </section>
 
+    <section class="pipeline-panel" aria-label="Report Dreamer validation pipeline">
+      <div class="compare-head">
+        <div>
+          <h3>Report Dreamer Pipeline</h3>
+          <p>Evidence-backed lifecycle from native SimLingo traces to an explicitly promoted RSSM checkpoint.</p>
+        </div>
+        <button class="compare-refresh" id="refreshPipeline">Refresh pipeline</button>
+      </div>
+      <div class="pipeline-overview">
+        <div class="pipeline-stage">
+          <span>Current phase</span>
+          <strong id="pipelinePhase">Loading pipeline...</strong>
+          <p id="pipelineNext">Reading collection, training and validation artifacts.</p>
+        </div>
+        <div class="pipeline-progress-block">
+          <div class="pipeline-progress-meta">
+            <span>Validated progress</span>
+            <strong id="pipelinePercent">0.0%</strong>
+          </div>
+          <div class="pipeline-track" role="progressbar" aria-label="Report Dreamer pipeline progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="pipelineTrack">
+            <div class="pipeline-fill" id="pipelineFill"></div>
+          </div>
+          <div class="pipeline-facts">
+            <div class="pipeline-fact"><span>Dataset</span><strong id="pipelineDataset">-</strong></div>
+            <div class="pipeline-fact"><span>Coverage</span><strong id="pipelineCoverage">-</strong></div>
+            <div class="pipeline-fact"><span>Checkpoint</span><strong id="pipelineCheckpoint">-</strong></div>
+          </div>
+        </div>
+      </div>
+      <div class="pipeline-grid" id="pipelineSteps"></div>
+      <div class="pipeline-next">
+        <span>Next verified action</span>
+        <strong id="pipelineAction">Waiting for pipeline status.</strong>
+      </div>
+    </section>
+
     <section class="compare-panel" aria-label="Dreamer comparison window">
       <div class="compare-head">
         <div>
           <h3>SAFE-DREAM KPI Comparison</h3>
-          <p>Same Family D/E metrics for native SimLingo, guarded Dreamer PPO/SDBS, and RL no-guard complement variants.</p>
+          <p>Same Family D/E metrics for native SimLingo, guarded Dreamer PPO, and active CarDreamer DreamerV3/RSSM mirror.</p>
         </div>
         <button class="compare-refresh" id="refreshCompare">Refresh KPIs</button>
       </div>
@@ -2564,6 +3956,7 @@ HTML = r"""<!doctype html>
 
   <script>
     let routes = [];
+    let reportPipeline = null;
     const $ = id => document.getElementById(id);
     const sceneMap = {
       any: {
@@ -2615,10 +4008,23 @@ HTML = r"""<!doctype html>
         image: "/assets/simlingo_teaser.png"
       }
     };
+    let dashboardConfig = {read_only: false};
     async function api(path, opts) {
       const r = await fetch(path, opts);
       if (!r.ok) throw new Error((await r.json()).error || await r.text());
       return r.json();
+    }
+    async function loadDashboardConfig() {
+      dashboardConfig = await api("/api/config");
+      if (!dashboardConfig.read_only) return;
+      document.body.classList.add("readonly");
+      ["go", "stop", "replay", "twinsentinel"].forEach(id => {
+        const control = $(id);
+        if (control) control.disabled = true;
+      });
+      $("go").textContent = "Read-only";
+      $("topStatus").textContent = "presentation mode";
+      $("status").textContent = "Read-only presentation: simulations and server actions are disabled.";
     }
     function esc(value) {
       return String(value ?? "-")
@@ -2628,9 +4034,45 @@ HTML = r"""<!doctype html>
         .replaceAll('"', "&quot;")
         .replaceAll("'", "&#039;");
     }
+    async function loadReportPipeline() {
+      const data = await api("/api/report-dreamer-pipeline");
+      reportPipeline = data;
+      const progress = Math.max(0, Math.min(100, Number(data.progress) || 0));
+      $("pipelinePhase").textContent = data.current_phase || "Unknown phase";
+      $("pipelineNext").textContent = data.next_step || "No next action reported.";
+      $("pipelineAction").textContent = data.next_step || "No next action reported.";
+      $("pipelinePercent").textContent = `${progress.toFixed(1)}%`;
+      $("pipelineFill").style.width = `${progress}%`;
+      $("pipelineTrack").setAttribute("aria-valuenow", progress.toFixed(1));
+      const dataset = data.dataset || {};
+      $("pipelineDataset").textContent = `${dataset.accepted_episodes || 0} episodes / ${(dataset.transitions || 0).toLocaleString()} ticks`;
+      $("pipelineCoverage").textContent = `${(dataset.towns || []).length} maps / ${(dataset.scenarios || []).length} scenarios`;
+      const checkpoints = data.checkpoints || {};
+      $("pipelineCheckpoint").textContent = checkpoints.production?.available
+        ? "production promoted"
+        : (checkpoints.candidate?.available ? "candidate ready" : "training candidate");
+      $("pipelineSteps").innerHTML = (data.phases || []).map(phase => {
+        const phaseProgress = Math.max(0, Math.min(100, 100 * (Number(phase.progress) || 0)));
+        return `
+          <article class="pipeline-step ${esc(phase.state)}">
+            <div class="pipeline-step-head">
+              <h4>${esc(phase.label)}</h4>
+              <span class="pipeline-state">${esc(phase.state)}</span>
+            </div>
+            <div class="pipeline-mini-track"><i style="width:${phaseProgress.toFixed(1)}%"></i></div>
+            <p>${esc(phase.detail)}</p>
+          </article>
+        `;
+      }).join("");
+      syncDreamerControls();
+    }
     async function loadDreamerComparison() {
       const data = await api("/api/dreamer-comparison");
-      $("compareCards").innerHTML = data.cards.map(card => `
+      const visibleDreamerIds = new Set(["simlingo", "dreamer_ppo", "report_rssm_learned"]);
+      const cards = (data.cards || []).filter(card => visibleDreamerIds.has(card.id));
+      const columns = (data.columns || []).filter(col => visibleDreamerIds.has(col.id));
+      const allRuns = (data.all_runs || []).filter(group => visibleDreamerIds.has(group.id));
+      $("compareCards").innerHTML = cards.map(card => `
         <article class="compare-card">
           <span class="compare-sub">${esc(card.subtitle)}</span>
           <h4>${esc(card.name)}</h4>
@@ -2644,7 +4086,6 @@ HTML = r"""<!doctype html>
           <p class="compare-note">${esc(card.note)}</p>
         </article>
       `).join("");
-      const columns = data.columns || [];
       $("compareHeadRow").innerHTML = `<th>KPI</th>${columns.map(col => `<th>${esc(col.label)}</th>`).join("")}`;
       $("compareRows").innerHTML = data.rows.map(row => `
         <tr>
@@ -2652,7 +4093,7 @@ HTML = r"""<!doctype html>
           ${columns.map(col => `<td>${esc((row.values || {})[col.id])}</td>`).join("")}
         </tr>
       `).join("");
-      $("observedRuns").innerHTML = (data.all_runs || []).map(group => `
+      $("observedRuns").innerHTML = allRuns.map(group => `
         <article class="observed-card">
           <h4>${esc(group.name)} - all observed runs</h4>
           <div class="observed-list">
@@ -2720,12 +4161,26 @@ HTML = r"""<!doctype html>
       $("mCatalog").textContent = `${compatible.length} routes / ${towns.length} maps`;
       updateRouteOptions();
     }
+    function setExperimentSeed(value) {
+      const seed = String(value || "").trim();
+      if (!seed) return;
+      $("seed").value = seed;
+      window.localStorage.setItem("simlingoExperimentSeed", seed);
+    }
+    function generateExperimentSeed() {
+      const seed = Math.floor(Math.random() * 999999) + 1;
+      setExperimentSeed(seed);
+      return seed;
+    }
     async function start(modeOverride) {
+      if (dashboardConfig.read_only) throw new Error("Read-only presentation: launch is disabled.");
+      const selectedSeed = $("seed").value.trim() || String(generateExperimentSeed());
+      setExperimentSeed(selectedSeed);
       const payload = {
         town: $("town").value,
         scenario: $("scenario").value,
         route_id: $("route").value,
-        seed: $("seed").value || Math.floor(Math.random() * 999999) + 1,
+        seed: selectedSeed,
         quality: $("quality").value,
         camera: $("camera").value,
         video_quality: $("video_quality").value,
@@ -2734,7 +4189,14 @@ HTML = r"""<!doctype html>
         playback_speed: $("playback_speed").value,
         run_mode: modeOverride || $("run_mode").value,
         dreamer_mode: $("dreamer_mode").value,
-        dreamer_online_learning: $("dreamer_online_learning").value,
+        report_checkpoint_role: $("report_checkpoint_role").value,
+        dreamer_online_learning: (
+          $("dreamer_mode").value === "cardreamer_rssm_mirror" ||
+          $("dreamer_mode").value.startsWith("report_rssm_")
+        )
+          ? "0"
+          : $("dreamer_online_learning").value,
+        cardreamer_residual_alpha: $("cardreamer_strength").value,
         dreamer_rl_action_space: "absolute",
         cot_mode: $("cot_mode").value,
         cot_interval: $("cot_interval").value,
@@ -2752,30 +4214,46 @@ HTML = r"""<!doctype html>
         tm_port: 8000
       };
       const data = await api("/api/start", {method:"POST", body:JSON.stringify(payload)});
-      const modeText = payload.run_mode === "sumo_mirror"
-        ? "CARLA POV + SUMO GUI"
-        : (payload.run_mode === "action_dreaming" ? "CARLA POV + Action Dreaming collect" : "CARLA POV");
+      setExperimentSeed(data.seed);
+      const modeLabels = {
+        sumo_mirror: "CARLA POV + SUMO GUI",
+        action_dreaming: "CARLA POV + Action Dreaming collect",
+        report_native_collect: "Report Phase 1 - native SimLingo collect",
+        pov: "CARLA POV"
+      };
+      const modeText = modeLabels[payload.run_mode] || payload.run_mode;
       const dreamerLabels = {
         off: "native SimLingo",
         dreamer_ppo: "Dreamer PPO",
         dreamer_sdbs: "Dreamer SDBS",
         dreamer_ppo_rl_noguard: "Dreamer PPO RL no-guard",
-        dreamer_sdbs_rl_noguard: "Dreamer SDBS RL no-guard"
+        dreamer_sdbs_rl_noguard: "Dreamer SDBS RL no-guard",
+        dreamer_ppo_rssm_v2: "Dreamer PPO RSSM V2 - experimental",
+        cardreamer_rssm_mirror: "CarDreamer RSSM mirror + traffic gate",
+        report_rssm_shadow: "Report RSSM shadow",
+        report_rssm_fixed: "Report C - fixed alpha",
+        report_rssm_learned: "Report D - learned alpha",
+        report_rssm_pairwise: "Report E - pairwise"
       };
       const dreamerText = dreamerLabels[payload.dreamer_mode] || payload.dreamer_mode;
+      const reportRoleText = payload.dreamer_mode.startsWith("report_rssm_")
+        ? ` / ${payload.report_checkpoint_role} checkpoint`
+        : "";
       const cotText = payload.cot_mode === "off" ? "CoT off" : `CoT ${payload.cot_mode}`;
       const rlText = payload.dreamer_online_learning === "1"
         ? "online RL training ON"
         : "checkpoint update OFF";
-      $("status").textContent = `Launching ${modeText} / ${dreamerText} / ${cotText} / ${rlText}: route ${data.route.id}, seed ${data.seed}.`;
+      $("status").textContent = `Launching ${modeText} / ${dreamerText}${reportRoleText} / ${cotText} / ${rlText}: route ${data.route.id}, seed ${data.seed}.`;
       refreshStatus();
     }
     async function stopRun() {
+      if (dashboardConfig.read_only) throw new Error("Read-only presentation: stop is disabled.");
       await api("/api/stop", {method:"POST"});
       $("status").textContent = "Stopped.";
       refreshStatus();
     }
     async function replayLatest() {
+      if (dashboardConfig.read_only) throw new Error("Read-only presentation: replay is disabled.");
       const data = await api("/api/replay", {
         method:"POST",
         body:JSON.stringify({playback_speed: $("playback_speed").value || "5"})
@@ -2783,6 +4261,7 @@ HTML = r"""<!doctype html>
       $("status").textContent = `Replay x${data.speed}: ${data.video}`;
     }
     async function openTwinSentinel() {
+      if (dashboardConfig.read_only) throw new Error("Read-only presentation: attack controls are disabled.");
       const data = await api("/api/twinsentinel/start", {method:"POST"});
       $("status").textContent = `TwinSentinel attack console ready: ${data.url}`;
       window.open(data.url, "_blank");
@@ -2794,13 +4273,20 @@ HTML = r"""<!doctype html>
       $("mScenario").textContent = data.scenario || "-";
       $("mMode").textContent = data.mode === "sumo_mirror"
         ? "CARLA + SUMO"
-        : (data.mode === "action_dreaming" ? "Action Dreaming" : (data.mode || "-"));
+        : (data.mode === "action_dreaming"
+          ? "Action Dreaming"
+          : (data.mode === "report_native_collect"
+            ? "Report native collect"
+            : (data.mode || "-")));
       const onlineStatus = data.online_rl_enabled ? ` / online ${data.online_rl_status || "running"}` : "";
-      $("mDreamer").textContent = `${data.dreamer_mode || "off"}${onlineStatus}`;
+      const reportRole = data.report_checkpoint_role ? ` / ${data.report_checkpoint_role}` : "";
+      $("mDreamer").textContent = `${data.dreamer_mode || "off"}${reportRole}${onlineStatus}`;
       $("mCot").textContent = data.cot_mode || "off";
       $("mSeed").textContent = data.seed || "-";
       $("mProcess").textContent = data.running ? "running" : "idle";
-      $("topStatus").textContent = data.running
+      $("topStatus").textContent = dashboardConfig.read_only
+        ? "presentation mode"
+        : data.running
         ? "simulation running"
         : (data.online_rl_enabled && data.online_rl_status === "updating_checkpoint" ? "online RL updating" : "idle");
       if (data.last_error) $("status").textContent = data.last_error;
@@ -2820,10 +4306,51 @@ HTML = r"""<!doctype html>
     $("town").onchange = updateRouteOptions;
     $("scenario").onchange = updateRouteOptions;
     $("route").onchange = updateScene;
+    const storedSeed = window.localStorage.getItem("simlingoExperimentSeed");
+    if (storedSeed) setExperimentSeed(storedSeed);
+    else generateExperimentSeed();
+    $("seed").addEventListener("change", () => {
+      if ($("seed").value) setExperimentSeed($("seed").value);
+    });
+    $("new_seed").onclick = generateExperimentSeed;
     $("go").onclick = () => start().catch(e => $("status").textContent = e.message);
+    function syncDreamerControls() {
+      const isCarDreamer = $("dreamer_mode").value === "cardreamer_rssm_mirror";
+      const isReportDreamer = $("dreamer_mode").value.startsWith("report_rssm_");
+      const isPairwise = $("dreamer_mode").value === "report_rssm_pairwise";
+      $("sumo_mirror_gui").disabled = $("run_mode").value !== "sumo_mirror";
+      $("cardreamer_strength").disabled = !isCarDreamer;
+      $("dreamer_online_learning").disabled = isCarDreamer || isReportDreamer;
+      $("report_checkpoint_role").disabled = !isReportDreamer;
+      if (isCarDreamer || isReportDreamer) $("dreamer_online_learning").value = "0";
+      if (reportPipeline) {
+        const candidate = reportPipeline.checkpoints?.candidate || {};
+        const production = reportPipeline.checkpoints?.production || {};
+        const candidateOption = $("report_checkpoint_role").querySelector('option[value="candidate"]');
+        const productionOption = $("report_checkpoint_role").querySelector('option[value="production"]');
+        const candidateReady = isPairwise ? candidate.pairwise_available : candidate.available;
+        const productionReady = isPairwise ? production.pairwise_available : production.available;
+        candidateOption.disabled = !candidateReady;
+        productionOption.disabled = !productionReady;
+        if (isReportDreamer && $("report_checkpoint_role").selectedOptions[0]?.disabled) {
+          if (candidateReady) $("report_checkpoint_role").value = "candidate";
+          else if (productionReady) $("report_checkpoint_role").value = "production";
+        }
+        const selectedReady = $("report_checkpoint_role").value === "candidate"
+          ? candidateReady
+          : productionReady;
+        $("go").disabled = dashboardConfig.read_only || (isReportDreamer && !selectedReady);
+      } else {
+        $("go").disabled = dashboardConfig.read_only;
+      }
+    }
+    $("dreamer_mode").addEventListener("change", syncDreamerControls);
+    $("run_mode").addEventListener("change", syncDreamerControls);
+    syncDreamerControls();
     $("stop").onclick = () => stopRun().catch(e => $("status").textContent = e.message);
     $("replay").onclick = () => replayLatest().catch(e => $("status").textContent = e.message);
     $("twinsentinel").onclick = () => openTwinSentinel().catch(e => $("status").textContent = e.message);
+    $("refreshPipeline").onclick = () => loadReportPipeline().catch(e => $("status").textContent = e.message);
     $("refreshCompare").onclick = () => loadDreamerComparison().catch(e => $("status").textContent = e.message);
     document.querySelectorAll(".route-card").forEach(card => {
       card.addEventListener("click", () => {
@@ -2840,9 +4367,12 @@ HTML = r"""<!doctype html>
       const y = (e.clientY / Math.max(1, window.innerHeight) - .5) * 10;
       $("world").style.transform = `perspective(1200px) rotateY(${x * .16}deg) rotateX(${-y * .12}deg)`;
     });
+    loadDashboardConfig().catch(e => $("status").textContent = e.message);
     loadRoutes().catch(e => $("status").textContent = e.message);
+    loadReportPipeline().catch(e => $("status").textContent = e.message);
     loadDreamerComparison().catch(e => $("status").textContent = e.message);
     setInterval(refreshStatus, 2000);
+    setInterval(() => loadReportPipeline().catch(() => {}), 5000);
     refreshStatus();
   </script>
 </body>
@@ -2855,11 +4385,22 @@ class ReusableThreadingHTTPServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _security_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+            "script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
+        )
+
     def _json(self, payload, status=200):
-        body = json.dumps(payload).encode()
+        body = json.dumps(share_safe_payload(payload)).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Cache-Control", "no-store")
+        self._security_headers()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -2871,6 +4412,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
+            self._security_headers()
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -2884,15 +4426,25 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Cache-Control", "no-store")
+                self._security_headers()
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
                 return
             self.send_error(404)
             return
+        if path == "/api/config":
+            self._json({"read_only": READ_ONLY})
+            return
         if path == "/api/routes":
+            routes = route_catalog()
+            if READ_ONLY:
+                routes = [
+                    {key: value for key, value in route.items() if key != "file"}
+                    for route in routes
+                ]
             self._json({
-                "routes": route_catalog(),
+                "routes": routes,
                 "installed_towns": sorted(installed_towns()),
                 "stable_towns": sorted(STABLE_TOWNS),
                 "show_experimental": SHOW_EXPERIMENTAL_TOWNS,
@@ -2918,9 +4470,18 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/dreamer-comparison":
             self._json(dreamer_comparison_payload())
             return
+        if path == "/api/report-dreamer-pipeline":
+            self._json(report_dreamer_pipeline_payload())
+            return
         self.send_error(404)
 
     def do_POST(self):
+        if READ_ONLY:
+            self._json(
+                {"ok": False, "error": "Read-only presentation: server actions are disabled."},
+                status=403,
+            )
+            return
         length = int(self.headers.get("Content-Length", "0") or 0)
         payload = {}
         if length:
@@ -2952,10 +4513,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     port = int(os.environ.get("SIMLINGO_DASHBOARD_PORT", "8765"))
-    server = ReusableThreadingHTTPServer(("127.0.0.1", port), Handler)
-    url = f"http://127.0.0.1:{port}"
+    server = ReusableThreadingHTTPServer((DASHBOARD_HOST, port), Handler)
+    display_host = "127.0.0.1" if DASHBOARD_HOST in ("0.0.0.0", "::") else DASHBOARD_HOST
+    url = f"http://{display_host}:{port}"
     (LOG_DIR / "dashboard_url.txt").write_text(url + "\n")
-    print(f"[simlingo-dashboard] {url}", flush=True)
+    mode = "read-only" if READ_ONLY else "interactive"
+    print(f"[simlingo-dashboard] {url} | bind={DASHBOARD_HOST} | mode={mode}", flush=True)
     try:
         while True:
             try:

@@ -33,6 +33,26 @@ import traci  # pylint: disable=wrong-import-position,import-error
 import sumolib  # pylint: disable=wrong-import-position,import-error
 
 
+EGO_SUMO_COLOR = (255, 235, 0, 0)
+BIKE_SUMO_COLOR = (120, 255, 40, 255)
+EGO_MARKER_OUTER_ID = "simlingo_ego_rectangle_outline"
+EGO_MARKER_INNER_ID = "simlingo_ego_rectangle"
+EGO_MARKER_OUTER_COLOR = (255, 255, 255, 255)
+EGO_MARKER_INNER_COLOR = (255, 235, 0, 255)
+EGO_ROLE_NAMES = {"hero", "hero0", "ego", "ego_vehicle", "simlingo", "leaderboard"}
+# Deliberately avoid dark and blue hues so actors remain visible on every SUMO theme.
+VISIBLE_SUMO_VEHICLE_COLORS = (
+    (255, 40, 180, 255),
+    (120, 255, 40, 255),
+    (255, 150, 20, 255),
+    (255, 255, 255, 255),
+    (255, 80, 70, 255),
+    (210, 255, 40, 255),
+    (255, 170, 220, 255),
+    (160, 255, 180, 255),
+)
+
+
 def parse_net_offset(net_file: Path):
     root = ET.parse(net_file).getroot()
     location = root.find("location")
@@ -63,9 +83,9 @@ def write_mirror_files(output_dir: Path, net_file: Path, additional_file: Path =
     routes_file.write_text(
         f"""<?xml version="1.0" encoding="UTF-8"?>
 <routes>
-  <vType id="mirror_ego" vClass="passenger" guiShape="passenger" length="4.8" width="1.9" color="0,80,255"/>
-  <vType id="mirror_vehicle" vClass="passenger" guiShape="passenger" length="4.8" width="1.9" color="180,180,180"/>
-  <vType id="mirror_bike" vClass="bicycle" guiShape="bicycle" length="1.8" width="0.6" color="0,180,80"/>
+  <vType id="mirror_ego" vClass="passenger" guiShape="passenger" length="4.8" width="1.9" color="255,235,0,0"/>
+  <vType id="mirror_vehicle" vClass="passenger" guiShape="passenger" length="4.8" width="1.9" color="255,40,180"/>
+  <vType id="mirror_bike" vClass="bicycle" guiShape="bicycle" length="1.8" width="0.6" color="120,255,40"/>
   <route id="mirror_dummy" edges="{dummy_edge}"/>
 </routes>
 """,
@@ -176,14 +196,96 @@ def carla_to_sumo_transform(transform, offset):
     return x, y, angle
 
 
+def rectangle_shape(x, y, angle, length, width):
+    radians = math.radians(angle)
+    forward_x, forward_y = math.sin(radians), math.cos(radians)
+    right_x, right_y = math.cos(radians), -math.sin(radians)
+    half_length = 0.5 * float(length)
+    half_width = 0.5 * float(width)
+    return [
+        (
+            x + longitudinal * forward_x + lateral * right_x,
+            y + longitudinal * forward_y + lateral * right_y,
+        )
+        for longitudinal, lateral in (
+            (half_length, half_width),
+            (half_length, -half_width),
+            (-half_length, -half_width),
+            (-half_length, half_width),
+        )
+    ]
+
+
+def upsert_ego_marker(marker_id, shape, color, layer, active_marker_ids):
+    if marker_id in active_marker_ids:
+        try:
+            traci.polygon.setShape(marker_id, shape)
+            return
+        except traci.TraCIException:
+            active_marker_ids.discard(marker_id)
+
+    traci.polygon.add(
+        polygonID=marker_id,
+        shape=shape,
+        color=color,
+        fill=True,
+        polygonType="simlingo_ego",
+        layer=layer,
+    )
+    active_marker_ids.add(marker_id)
+
+
+def center_sumo_views_on_ego(x, y):
+    try:
+        view_ids = traci.gui.getIDList()
+    except (AttributeError, traci.TraCIException):
+        return
+    for view_id in view_ids:
+        try:
+            traci.gui.setOffset(view_id, x, y)
+        except traci.TraCIException:
+            continue
+
+
+def update_ego_rectangle(actor, offset, active_marker_ids, follow_in_gui=False):
+    x, y, angle = carla_to_sumo_transform(actor.get_transform(), offset)
+    marker_specs = (
+        (
+            EGO_MARKER_OUTER_ID,
+            rectangle_shape(x, y, angle, length=7.0, width=3.4),
+            EGO_MARKER_OUTER_COLOR,
+            1000,
+        ),
+        (
+            EGO_MARKER_INNER_ID,
+            rectangle_shape(x, y, angle, length=6.2, width=2.6),
+            EGO_MARKER_INNER_COLOR,
+            1001,
+        ),
+    )
+    for marker_id, shape, color, layer in marker_specs:
+        upsert_ego_marker(marker_id, shape, color, layer, active_marker_ids)
+    if follow_in_gui:
+        center_sumo_views_on_ego(x, y)
+
+
+def remove_ego_rectangle(active_marker_ids):
+    for marker_id in tuple(active_marker_ids):
+        try:
+            traci.polygon.remove(marker_id)
+        except traci.TraCIException:
+            pass
+        active_marker_ids.discard(marker_id)
+
+
 def carla_speed(actor) -> float:
     velocity = actor.get_velocity()
     return math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y + velocity.z * velocity.z)
 
 
 def is_ego_vehicle(actor) -> bool:
-    role = actor.attributes.get("role_name", "").lower()
-    return role in {"hero", "ego", "simlingo", "leaderboard"}
+    role = actor.attributes.get("role_name", "").strip().lower()
+    return role in EGO_ROLE_NAMES or role.startswith(("hero", "ego", "simlingo", "leaderboard"))
 
 
 def vtype_for_actor(actor) -> str:
@@ -197,15 +299,12 @@ def vtype_for_actor(actor) -> str:
 
 def vehicle_color(actor):
     if is_ego_vehicle(actor):
-        return (0, 80, 255, 255)
-    raw = actor.attributes.get("color")
-    if raw:
-        try:
-            r, g, b = [int(part) for part in raw.split(",")[:3]]
-            return (r, g, b, 255)
-        except ValueError:
-            pass
-    return None
+        return EGO_SUMO_COLOR
+    if vtype_for_actor(actor) == "mirror_bike":
+        return BIKE_SUMO_COLOR
+    return VISIBLE_SUMO_VEHICLE_COLORS[
+        int(actor.id) % len(VISIBLE_SUMO_VEHICLE_COLORS)
+    ]
 
 
 def add_or_update_vehicle(actor, active_ids, offset):
@@ -1132,6 +1231,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, handle_signal)
 
     active_ids = set()
+    active_ego_marker_ids = set()
     active_attacks = []
     command_cursor = {"offset": 0}
     if args.attack_command_file:
@@ -1154,9 +1254,19 @@ def main() -> int:
                 vehicles = list(world.get_actors().filter("vehicle.*"))
 
             seen = set()
+            ego_seen = False
             fatal_sumo_error = None
             for actor in vehicles:
                 try:
+                    if is_ego_vehicle(actor):
+                        ego_seen = True
+                        update_ego_rectangle(
+                            actor,
+                            offset,
+                            active_ego_marker_ids,
+                            follow_in_gui=args.sumo_gui,
+                        )
+                        continue
                     seen.add(add_or_update_vehicle(actor, active_ids, offset))
                 except Exception as exc:
                     if is_fatal_traci_error(exc):
@@ -1166,6 +1276,9 @@ def main() -> int:
             if fatal_sumo_error is not None:
                 print(f"[carla-sumo-mirror] SUMO connection closed: {fatal_sumo_error}", flush=True)
                 break
+
+            if not ego_seen and active_ego_marker_ids:
+                remove_ego_rectangle(active_ego_marker_ids)
 
             for veh_id in sorted(active_ids - seen):
                 try:

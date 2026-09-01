@@ -1,223 +1,195 @@
 # VLA-AV SimLingo World
 
-Research pipeline for evaluating and extending SimLingo in CARLA/Bench2Drive:
+Closed-loop research platform for SimLingo, CARLA 0.9.15, Bench2Drive, SUMO,
+TwinSentinel attacks, and residual Dreamer/RSSM policies.
 
-- Native SimLingo closed-loop driving with Pygame POV replay.
-- Dreamer PPO and Dreamer SDBS runtime adapters.
-- RL no-guard Dreamer training scaffolding with protected checkpoints.
-- CARLA/SUMO mirror and TwinSentinel attack console integration.
-- SAFE-DREAM KPI dashboard for native SimLingo, Dreamer PPO, Dreamer SDBS, and RL no-guard variants.
+The repository contains the complete active frontend and backend source. The
+only components downloaded after cloning are third-party binaries or public
+weights that are too large or cannot legally be redistributed here: CARLA, the
+SimLingo Hugging Face checkpoint, and optional research datasets.
 
-The current working entrypoint is the local dashboard:
+## Current Pipeline
 
-```bash
-cd ~/Desktop/vla-av
-bash scripts/stop_simlingo_dashboard.sh
-bash scripts/run_simlingo_dashboard.sh
-```
+- Native SimLingo evaluation on the 220 Bench2Drive route XML files.
+- Pygame ego/chase view, recording, replay, and live model overlays.
+- SimLingo + guarded Dreamer PPO complement.
+- SimLingo + report-aligned Dreamer/RSSM D with learned residual authority.
+- Bidirectional CARLA/SUMO mirror and TwinSentinel attack console.
+- SAFE-DREAM and Bench2Drive KPI comparison.
+- Static read-only Streamlit presentation containing the current KPI snapshot.
+- Isolated DreamerV3/RSSM audit and training pipeline with explicit kill gates.
 
-Open:
+The local dashboard currently exposes only the three validated presentation
+choices:
 
-```text
-http://127.0.0.1:8765
-```
+| UI choice | Runtime artifact | Role |
+| --- | --- | --- |
+| Off - native SimLingo | SimLingo checkpoint | Closed-loop baseline |
+| Dreamer PPO | `external/simlingo/checkpoints/dreamer_guard/best_world_model.pt` | Guarded residual complement |
+| Dreamer RSSM D - learned alpha | `checkpoints/report_aligned_dreamer/production/report_dreamer.pt` | Report-aligned RSSM complement |
+
+Older SDBS, no-guard RL, CarDreamer mirror, and ablation backends remain in the
+source tree for reproducibility, but they are deliberately hidden from the
+main selector until they pass the frozen evaluation protocol.
+
+The optional official CarDreamer overtake checkpoint is reproducibly downloaded
+and checksum-verified with `bash scripts/download_cardreamer_overtake_checkpoint.sh`.
 
 ## Repository Layout
 
 ```text
-scripts/                         Launchers, dashboard, CARLA/SUMO bridge, RL helpers
-external/simlingo/                Vendored SimLingo + Bench2Drive integration
-external/simlingo/team_code/      SimLingo agent and Dreamer runtime adapter
-experiments/dreamer_ppo_carla/    Dreamer PPO v1 training code
-experiments/dreamer_ppo_carla_sdbs_fresh/
-                                  Dreamer SDBS training code
-experiments/TwinSentinel_Project/ TwinSentinel attack console integration
-docs/                             Project handoffs and validation notes
+configs/                         Dreamer/RSSM and training protocols
+data/README.md                   Dataset inventory; raw data stays local
+docs/                            Architecture, attribution, experiment protocols
+external/simlingo/               SimLingo, Bench2Drive, ScenarioRunner, agent code
+external/cardreamer_upstream/    Flattened upstream CarDreamer source and licenses
+experiments/dreamer_ppo_carla/   Dreamer PPO v1 training/evaluation source
+experiments/TwinSentinel_Project TwinSentinel attack console and adapters
+scripts/                         Launch, mirror, collection, training, audit, export
+src/                             Report Dreamer, DeepAccident, residual DreamerV3
+streamlit_share/                 Static presentation app and KPI snapshot
+tests/                           Runtime, reward, dashboard, and world-model tests
 ```
 
-Large/private local artifacts are intentionally ignored by Git: logs, videos,
-datasets, VM backups, downloaded models, pretrained VLM caches, credentials, and
-CARLA itself. A fresh clone does not give anyone access to Mohammed's PC, tokens,
-private data, local videos, or backups.
+## Fresh Ubuntu 22.04 Installation
 
-## Runtime Modes
+The detailed checklist is in [docs/FRESH_INSTALL.md](docs/FRESH_INSTALL.md).
+The short path is:
 
-The dashboard Dreamer selector maps to these checkpoints:
+```bash
+cd ~/Desktop
+git clone https://github.com/Moha-C/vla-av.git
+cd vla-av
+git lfs install
+git lfs pull
 
-| Dashboard mode | Checkpoint | Notes |
-| --- | --- | --- |
-| Off - native SimLingo | none | SimLingo baseline |
-| Dreamer PPO | `external/simlingo/checkpoints/dreamer_guard/best_world_model.pt` | guarded runtime that currently works |
-| Dreamer SDBS | `external/simlingo/checkpoints/dreamer_sdbs_fresh/best_world_model.pt` | guarded SDBS runtime |
-| Dreamer PPO RL no guard | `external/simlingo/checkpoints/dreamer_ppo_rl_noguard/latest_rl_model.pt` | separate seed checkpoint now; replace after validated RL training |
-| Dreamer SDBS RL no guard | `external/simlingo/checkpoints/dreamer_sdbs_rl_noguard/latest_rl_model.pt` | separate seed checkpoint now; replace after validated RL training |
+bash scripts/install_system_deps_ubuntu22.sh
+INSTALL_ADDITIONAL_MAPS=1 bash scripts/install_carla_0915.sh
 
-Note: internally, the runtime environment variable is still named
-`SIMLINGO_DREAMER_GUARD`. Setting it to `0` disables the Dreamer adapter entirely.
-The `RL no guard` dashboard modes therefore keep the adapter enabled, but disable
-the added recovery/collision-shield layers and route the mode to its own
-`latest_rl_model.pt` checkpoint.
+conda env create -f environment.simlingo.yml
+conda activate simlingo
+bash scripts/download_simlingo_model.sh
 
-The guarded checkpoints are backed up in:
-
-```text
-external/simlingo/checkpoints/guarded_before_rl_20260730_142415/
+export CARLA_ROOT="$HOME/carla_simulator"
+export SUMO_HOME=/usr/share/sumo
+bash scripts/check_fresh_install.sh
 ```
 
-## System Requirements
+Bench2Drive, ScenarioRunner, route XML files, CARLA/SUMO synchronization code,
+and the web frontend are already vendored in this repository. They must not be
+cloned separately.
 
-Tested local setup:
-
-- Ubuntu 22.04
-- NVIDIA GPU with working driver
-- CARLA 0.9.15 installed at `~/carla_simulator`
-- SUMO 1.18.0 installed from Ubuntu packages
-- Miniconda
-- Python 3.8.18 in the `simlingo` env
-
-For a new machine, follow:
-
-```text
-docs/FRESH_INSTALL.md
-```
-
-Install system dependencies:
+## Interactive Dashboard
 
 ```bash
 cd ~/Desktop/vla-av
-bash scripts/install_system_deps_ubuntu22.sh
-```
-
-Install CARLA 0.9.15 manually, then set:
-
-```bash
-export CARLA_ROOT=$HOME/carla_simulator
-export SUMO_HOME=/usr/share/sumo
-```
-
-CARLA is not committed to GitHub because it is too large.
-
-## Python Environment
-
-Recommended:
-
-```bash
-conda env create -f environment.simlingo.yml
 conda activate simlingo
+bash scripts/stop_simlingo_dashboard.sh
+bash scripts/run_simlingo_dashboard.sh
 ```
 
-If you already have the env:
+Open `http://127.0.0.1:8765`. This local process can launch CARLA, SUMO,
+SimLingo, Dreamer modes, recordings, and TwinSentinel attacks.
+
+## Read-Only Streamlit Share
+
+The Streamlit app is intentionally a static presentation. It embeds no backend,
+does not connect to the local dashboard, and cannot launch, stop, replay, attack,
+or update a checkpoint.
+
+Refresh its sanitized KPI snapshot before publishing:
 
 ```bash
-conda activate simlingo
-pip install -r requirements.txt
+cd ~/Desktop/vla-av
+python3 scripts/export_streamlit_dashboard.py
+bash scripts/run_streamlit_dashboard_readonly.sh
 ```
 
-For exact provenance of the current local environment, the repository also
-contains:
+Local Streamlit URL: `http://127.0.0.1:8501`.
 
-```text
-environment.simlingo-lock.yml
-requirements.freeze.txt
+For Streamlit Community Cloud, use `streamlit_share/app.py` as the entrypoint.
+The committed files are:
+
+- `streamlit_share/dashboard_snapshot.html`: self-contained frontend.
+- `streamlit_share/kpi_snapshot.json`: inspectable copy of the current KPI data.
+
+## CARLA, SUMO, And Bench2Drive
+
+This project is pinned to CARLA 0.9.15. The installer downloads the official
+Linux package and, with `INSTALL_ADDITIONAL_MAPS=1`, the official additional map
+archive needed by Bench2Drive towns:
+
+```bash
+INSTALL_ADDITIONAL_MAPS=1 bash scripts/install_carla_0915.sh
 ```
 
-Use those as reference/lock files if another machine needs to match this setup
-as closely as possible.
+SUMO is installed from Ubuntu packages and expected at `/usr/share/sumo`.
+The dashboard's SUMO mirror starts from the same CARLA world and mirrors actors,
+traffic lights, and ego state. TwinSentinel attacks target that active bridge;
+they do not start an unrelated SUMO simulation.
 
-## SimLingo Model Weights
+## Model Weights
 
-The SimLingo checkpoint is expected at:
+The large SimLingo model is downloaded from `RenzKa/simlingo` into:
 
 ```text
 models/simlingo_hf/simlingo/checkpoints/epoch=013.ckpt/pytorch_model.pt
 ```
 
-Download it with:
+Run `bash scripts/download_simlingo_model.sh`. If Hugging Face authentication is
+ever required, every user must authenticate with their own account. No token is
+stored in Git.
+
+Small promoted Dreamer checkpoints are versioned with Git LFS. A fresh clone
+must run `git lfs pull`; otherwise the files remain text pointers and the fresh
+install checker will reject them.
+
+## Dreamer Research Branches
+
+The report-aligned branch keeps SimLingo as the reference controller and learns
+a residual action plus continuous authority. Its protocol is documented in:
+
+- [Report-aligned architecture](docs/REPORT_ALIGNED_DREAMER_ARCHITECTURE.md)
+- [Frozen validation protocol](docs/REPORT_ALIGNED_DREAMER_PROTOCOL.md)
+- [Residual DreamerV3 protocol](docs/RESIDUAL_DREAMERV3_PROTOCOL.md)
+- [Third-party attribution](docs/THIRD_PARTY_DREAMER_ATTRIBUTION.md)
+
+Run the report branch software tests with:
 
 ```bash
-cd ~/Desktop/vla-av
-bash scripts/download_simlingo_model.sh
+bash scripts/test_report_dreamer.sh
 ```
 
-The large Hugging Face model directory is ignored by Git.
-
-If Hugging Face authentication is ever needed, each user must use their own
-account/token. Do not commit tokens into this repository.
-
-## Run The Dashboard
+Run the isolated residual DreamerV3 data audit, baseline comparison, training,
+and gate with:
 
 ```bash
-cd ~/Desktop/vla-av
-bash scripts/stop_simlingo_dashboard.sh
-bash scripts/run_simlingo_dashboard.sh
+bash scripts/run_residual_dreamerv3_pipeline.sh
 ```
 
-The dashboard can launch:
+A candidate is never substituted for the promoted runtime model automatically.
+Prediction gates and frozen closed-loop evaluation must pass first.
 
-- CARLA POV SimLingo runs.
-- CARLA + SUMO mirror runs.
-- Dreamer PPO / SDBS guarded runs.
-- TwinSentinel attack console.
-- SAFE-DREAM KPI comparison.
+## Privacy And Artifact Policy
 
-## RL No-Guard Training
+Git intentionally excludes:
 
-Prepare protected seed checkpoints:
+- `.env`, Streamlit secrets, API tokens, SSH keys, and credentials;
+- CARLA binaries and Hugging Face caches;
+- logs, videos, replay buffers, datasets, exports, and workstation backups;
+- failed/candidate checkpoints and optimizer state;
+- historical Alpamayo, Maram, and VM side experiments not used at runtime.
+
+This does not prevent reproduction: installation scripts retrieve public
+dependencies, collection scripts regenerate training data, and promoted small
+runtime checkpoints are included through Git LFS. It prevents a clone from
+receiving private workstation data.
+
+Before every publication, run:
 
 ```bash
-cd ~/Desktop/vla-av
-bash scripts/prepare_dreamer_rl_noguard_checkpoints.sh
+bash scripts/audit_repository_for_publish.sh
 ```
 
-Start PPO RL no-guard training:
-
-```bash
-DREAMER_RL_KIND=ppo DREAMER_RL_DEVICE=cuda DREAMER_RL_EPISODES=100 \
-  bash scripts/start_dreamer_rl_noguard_training.sh
-```
-
-Watch PPO:
-
-```bash
-DREAMER_RL_KIND=ppo bash scripts/watch_dreamer_rl_noguard_training.sh
-```
-
-Start SDBS RL no-guard training:
-
-```bash
-DREAMER_RL_KIND=sdbs DREAMER_RL_DEVICE=cuda DREAMER_RL_EPISODES=100 \
-  bash scripts/start_dreamer_rl_noguard_training.sh
-```
-
-Watch SDBS:
-
-```bash
-DREAMER_RL_KIND=sdbs bash scripts/watch_dreamer_rl_noguard_training.sh
-```
-
-The current `latest_rl_model.pt` files are separate seed copies so the dashboard
-options are wired without touching the guarded modes. After a real run is
-visually and metrically validated, install its best checkpoint for the dashboard:
-
-```bash
-DREAMER_RL_KIND=ppo bash scripts/install_dreamer_rl_noguard_checkpoint.sh
-DREAMER_RL_KIND=sdbs bash scripts/install_dreamer_rl_noguard_checkpoint.sh
-```
-
-By default, training does not overwrite dashboard runtime checkpoints.
-
-## GitHub Notes
-
-This project contains very large local artifacts. The `.gitignore` excludes
-logs, recordings, datasets, VM backups, downloaded models, and CARLA binaries.
-
-Use Git LFS for binary checkpoints if you decide to track them:
-
-```bash
-git lfs install
-git lfs track "*.pt" "*.ckpt" "*.safetensors" "*.mp4" "*.zip"
-```
-
-If a nested upstream repo should be committed as normal files, remove or move its
-nested `.git` folder first. Otherwise Git will treat it as an embedded repository
-or submodule.
+The audit scans every indexed file for common token/private-key signatures,
+credential filenames, and oversized Git blobs.

@@ -15,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DASHBOARD_SOURCE = ROOT / "scripts" / "simlingo_dashboard.py"
 DEFAULT_OUTPUT = ROOT / "streamlit_share" / "dashboard_snapshot.html"
+DEFAULT_KPI_OUTPUT = ROOT / "streamlit_share" / "kpi_snapshot.json"
 
 
 def load_dashboard_module():
@@ -135,20 +136,39 @@ def build_snapshot(module):
             raise FileNotFoundError(f"Dashboard asset missing: {path}")
         html = html.replace(f"/assets/{name}", asset_data_url(path))
 
-    return html, generated_at, len(routes)
+    return html, snapshot, generated_at, len(routes)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--kpi-output", type=Path, default=DEFAULT_KPI_OUTPUT)
     args = parser.parse_args()
 
     module = load_dashboard_module()
-    html, generated_at, route_count = build_snapshot(module)
+    html, snapshot, generated_at, route_count = build_snapshot(module)
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(html, encoding="utf-8")
+
+    kpi_output = args.kpi_output.resolve()
+    kpi_output.parent.mkdir(parents=True, exist_ok=True)
+    kpi_output.write_text(
+        json.dumps(
+            {
+                "schema": "vla_av_readonly_kpi_snapshot_v1",
+                "generated_at": generated_at,
+                "comparison": snapshot["/api/dreamer-comparison"],
+            },
+            ensure_ascii=True,
+            indent=2,
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     print(f"[streamlit-share] snapshot={output}")
+    print(f"[streamlit-share] kpis={kpi_output}")
     print(f"[streamlit-share] generated_at={generated_at}")
     print(f"[streamlit-share] routes={route_count} size_bytes={output.stat().st_size}")
 

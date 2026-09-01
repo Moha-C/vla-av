@@ -15,15 +15,20 @@ sudo apt-get install -y \
   libgl1 \
   libglib2.0-0 \
   libjpeg-dev \
+  libomp5 \
   libpng-dev \
   libsdl2-2.0-0 \
   libsm6 \
+  libvulkan1 \
   libxext6 \
   libxrender1 \
   mesa-utils \
   net-tools \
+  nodejs \
+  npm \
   openssh-client \
   python3-pip \
+  python3-venv \
   rsync \
   sumo \
   sumo-tools \

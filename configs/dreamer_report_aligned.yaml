@@ -1,0 +1,117 @@
+version: report_aligned_v2
+
+observation:
+  max_speed_mps: 30.0
+  max_accel_mps2: 10.0
+  max_progress_delta_m: 5.0
+  max_lane_distance_m: 5.0
+  max_clearance_m: 80.0
+  max_relative_speed_mps: 40.0
+  max_ttc_s: 20.0
+  max_blocked_ticks: 200.0
+  max_return_distance_m: 50.0
+  max_curvature: 0.25
+
+rssm:
+  observation_dim: 32
+  # Physical CARLA control only. Alpha is authority metadata, not dynamics.
+  action_dim: 3
+  encoder_dim: 128
+  hidden_dim: 256
+  deterministic_size: 128
+  stochastic_size: 16
+  categorical_classes: 16
+  unimix: 0.01
+  free_nats: 1.0
+  dynamics_kl_scale: 0.5
+  representation_kl_scale: 0.1
+  imagination_horizon: 8
+
+prediction_loss:
+  observation: 1.0
+  progress: 1.0
+  risk: 2.0
+  continuation: 1.0
+  value: 0.5
+  collision: 2.0
+  offroad: 1.5
+
+candidates:
+  slow_factors: [0.70, 0.40]
+  steer_offsets: [-0.18, -0.08, 0.08, 0.18]
+  overtake_steer: 0.28
+  return_steer: 0.20
+  assumed_alpha: 0.60
+  max_steer_delta: 0.35
+  include_actor_candidate: true
+
+evaluator:
+  lambda_progress: 1.0
+  lambda_risk: 3.0
+  lambda_change: 0.20
+  continuation_discount: 0.99
+  pairwise_scale: 0.25
+
+reward:
+  w_progress: 1.0
+  w_safe: 1.0
+  w_collision: 20.0
+  w_offroad: 10.0
+  w_jerk: 0.20
+  w_alpha: 0.05
+  collision_terminal: true
+
+authority:
+  enabled: true
+  learned: true
+  fixed_alpha: 0.15
+  max_alpha: 0.70
+  smoothing: 0.80
+  max_delta_per_step: 0.08
+  exact_native_epsilon: 1.0e-8
+
+pairwise:
+  enabled: false
+  checkpoint: ""
+  hidden_dim: 128
+
+policy:
+  hidden_dim: 256
+  min_std: 0.05
+  max_std: 0.70
+  max_steer_residual: 0.35
+  max_longitudinal_residual: 0.60
+  entropy_scale: 0.001
+  lambda_return: 0.95
+
+training:
+  batch_size: 32
+  sequence_length: 32
+  learning_rate: 0.0003
+  actor_lr: 0.00008
+  critic_lr: 0.00008
+  pairwise_lr: 0.0001
+  world_model_epochs: 30
+  policy_epochs: 30
+  pairwise_epochs: 20
+  train_ratio: 0.70
+  validation_ratio: 0.15
+  test_ratio: 0.15
+  minimum_train_seeds: 2
+  minimum_validation_seeds: 2
+  minimum_test_seeds: 2
+  split_seed: 20260818
+  gradient_clip: 100.0
+  checkpoint_dir: checkpoints/report_aligned_dreamer
+  # Production default: Phase 1 data collected while native SimLingo alone
+  # controls CARLA. Use source_policy=any only for explicit smoke diagnostics.
+  source_policy: simlingo_native
+  require_event_ground_truth: true
+
+runtime:
+  # A=native, B=legacy guards, C=fixed alpha, D=learned alpha, E=pairwise.
+  ablation: D
+  shadow: false
+  deterministic_latent: true
+  deterministic_policy: true
+  trace_path: ""

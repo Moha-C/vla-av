@@ -1,8 +1,9 @@
-"""Conservative Dreamer guard for SimLingo closed-loop evaluation.
+"""Dreamer complements for SimLingo closed-loop evaluation.
 
-The guard is intentionally not a replacement policy. It scores a small set of
-actions around SimLingo's own control and may only apply an override when the
-learned world model predicts a clear risk reduction under strict constraints.
+Legacy modes retain their configured guards. The RSSM path is explicitly
+guard-free: it compares SimLingo and policy futures with a learned world model
+and continuously scales model authority by the score margin and held-out model
+uncertainty.
 """
 
 from __future__ import annotations
@@ -17,6 +18,29 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+try:
+    from .dreamer_world_models import (
+        UTILITY_MODEL_TYPE as RSSM_UTILITY_MODEL_TYPE,
+        WORLD_MODEL_TYPE as RSSM_WORLD_MODEL_TYPE,
+        PairwiseUtilityCalibrator,
+        RSSMConfig,
+        RSSMState,
+        TemporalRSSMWorldModel,
+        discounted_feature_pool,
+        symexp,
+    )
+except ImportError:
+    from dreamer_world_models import (
+        UTILITY_MODEL_TYPE as RSSM_UTILITY_MODEL_TYPE,
+        WORLD_MODEL_TYPE as RSSM_WORLD_MODEL_TYPE,
+        PairwiseUtilityCalibrator,
+        RSSMConfig,
+        RSSMState,
+        TemporalRSSMWorldModel,
+        discounted_feature_pool,
+        symexp,
+    )
+
 
 LIGHT_TO_FLOAT = {
     "red": 0.0,
@@ -28,7 +52,14 @@ LIGHT_TO_FLOAT = {
 MAP_INVARIANT_POLICY_INPUT_SEMANTICS = (
     "world_state_plus_simlingo_map_invariant_temporal_context_v5"
 )
+CURRENT_ONCOMING_POLICY_INPUT_SEMANTICS = (
+    "world_state_plus_simlingo_temporal_current_oncoming_context_v6"
+)
+MAP_INVARIANT_CURRENT_ONCOMING_POLICY_INPUT_SEMANTICS = (
+    "world_state_plus_simlingo_map_invariant_temporal_current_oncoming_context_v6"
+)
 MAP_INVARIANT_WORLD_STATE_INDICES = (0, 1, 3)
+OPPOSING_HEADING_DOT_THRESHOLD = -0.25
 
 
 class WorldModel(nn.Module):
@@ -177,6 +208,55 @@ def _clip(value: float, low: float, high: float) -> float:
     return float(max(low, min(high, value)))
 
 
+def rssm_authority_confidence(score_advantage: float, temperature: float) -> float:
+    """Map positive imagined utility margin to continuous model confidence.
+
+    ``temperature`` comes from held-out RSSM risk/progress errors. This mapping
+    has no scene threshold or veto: authority grows smoothly from zero and
+    approaches one only when the imagined advantage dominates model error.
+    """
+
+    try:
+        advantage = float(score_advantage)
+        scale = float(temperature)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(advantage) or advantage <= 0.0:
+        return 0.0
+    if not math.isfinite(scale) or scale <= 0.0:
+        scale = 1e-6
+    return _clip(-math.expm1(-advantage / scale), 0.0, 1.0)
+
+
+def _scale_control_authority(
+    base_action: np.ndarray,
+    proposed_action: np.ndarray,
+    confidence: float,
+    effective_intervention: float,
+) -> np.ndarray:
+    """Continuously move from SimLingo toward a policy proposal.
+
+    Longitudinal control is blended as one signed value so scaling authority
+    cannot create simultaneous throttle and brake commands.
+    """
+
+    base = np.asarray(base_action, dtype=np.float32).reshape(-1)
+    proposed = np.asarray(proposed_action, dtype=np.float32).reshape(-1)
+    blend = _clip(float(confidence), 0.0, 1.0)
+    steering = float(base[0]) + blend * (float(proposed[0]) - float(base[0]))
+    base_longitudinal = float(base[1]) - float(base[2])
+    proposed_longitudinal = float(proposed[1]) - float(proposed[2])
+    longitudinal = base_longitudinal + blend * (
+        proposed_longitudinal - base_longitudinal
+    )
+    return np.asarray([
+        _clip(steering, -1.0, 1.0),
+        _clip(max(0.0, longitudinal), 0.0, 1.0),
+        _clip(max(0.0, -longitudinal), 0.0, 1.0),
+        _clip(float(effective_intervention), 0.0, 1.0),
+    ], dtype=np.float32)
+
+
 def _actor_speed(actor: Any) -> float:
     try:
         velocity = actor.get_velocity()
@@ -191,6 +271,20 @@ def _actor_longitudinal_speed(actor: Any, forward: Any) -> float:
         return float(velocity.x * forward.x + velocity.y * forward.y + velocity.z * forward.z)
     except Exception:
         return 0.0
+
+
+def _is_opposing_vehicle_heading(heading_dot: float) -> bool:
+    """Return whether a vehicle faces against the ego lane direction.
+
+    Orientation, not instantaneous velocity, defines opposing traffic. An
+    oncoming vehicle stopped by congestion or a traffic light must remain in
+    the RSSM observation; otherwise it disappears exactly when both vehicles
+    are stationary and the planner is deciding whether to overtake.
+    """
+    try:
+        return math.isfinite(float(heading_dot)) and float(heading_dot) < OPPOSING_HEADING_DOT_THRESHOLD
+    except (TypeError, ValueError):
+        return False
 
 
 def _traffic_light_state(hero: Any) -> str:
@@ -212,27 +306,168 @@ class DreamerGuard:
         self.config = config
         self.device = torch.device(config.device)
         ckpt = torch.load(config.checkpoint, map_location=self.device)
-        state_dict = ckpt.get("model")
-        checkpoint_schema = "simlingo_guard"
-        if state_dict is None and "world_model" in ckpt:
-            state_dict = ckpt["world_model"]
-            checkpoint_schema = "youma_dreamer_ppo"
-        if state_dict is None:
-            raise KeyError("Dreamer checkpoint must contain either 'model' or 'world_model'.")
-
-        fc1_weight = state_dict.get("fc1.weight")
-        if fc1_weight is None:
-            raise KeyError("Dreamer checkpoint is missing world model layer 'fc1.weight'.")
-        hidden = int(fc1_weight.shape[0])
+        world_model_type = str(ckpt.get("world_model_type", "legacy_one_step_mlp_v1"))
+        self.is_temporal_world_model = world_model_type == RSSM_WORLD_MODEL_TYPE
+        self.rssm_config: Optional[RSSMConfig] = None
+        self.rssm_state: Optional[RSSMState] = None
+        self.rssm_current_observation_normalized: Optional[torch.Tensor] = None
+        self.previous_rssm_action: Optional[np.ndarray] = None
+        self.rssm_utility_calibrator: Optional[PairwiseUtilityCalibrator] = None
+        self.rssm_utility_blend = 0.0
+        rssm_metadata = ckpt.get("rssm_v2") or {}
+        self.rssm_planning_horizon = max(
+            1,
+            int(rssm_metadata.get("planning_horizon", 5)),
+        )
+        self.rssm_planning_discount = _clip(
+            float(rssm_metadata.get("planning_discount", 0.95)),
+            0.0,
+            1.0,
+        )
+        arbitration = rssm_metadata.get("arbitration") or {}
+        # These capabilities are opt-in checkpoint contracts.  Keeping their
+        # defaults false preserves every deployed RSSM checkpoint exactly.
+        self.rssm_closed_loop_actor_rollout = bool(
+            arbitration.get("closed_loop_actor_rollout", False)
+        )
+        self.rssm_actor_sigma_shooting = bool(
+            arbitration.get("actor_sigma_shooting", False)
+        )
+        self.rssm_candidate_commit_horizon = max(
+            1,
+            min(
+                self.rssm_planning_horizon,
+                int(arbitration.get("candidate_commit_horizon", 1)),
+            ),
+        )
+        self.rssm_progress_weight = max(
+            0.0,
+            float(arbitration.get("progress_weight", config.w_progress)),
+        )
+        self.rssm_risk_weight = max(
+            0.0,
+            float(arbitration.get("risk_weight", config.w_risk)),
+        )
+        self.rssm_risk_curvature = max(
+            0.0,
+            float(arbitration.get("risk_curvature", 0.0)),
+        )
+        self.rssm_action_penalty = max(
+            0.0,
+            float(arbitration.get("action_penalty", config.action_penalty)),
+        )
+        calibration_basis = arbitration.get("calibration_basis") or {}
+        fallback_authority_temperature = (
+            float(calibration_basis.get("progress_mae_m", 0.15))
+            + self.rssm_risk_weight
+            * float(calibration_basis.get("risk_mae", 0.18))
+        )
+        self.rssm_authority_temperature = max(
+            1e-6,
+            float(
+                arbitration.get(
+                    "authority_temperature",
+                    fallback_authority_temperature,
+                )
+            ),
+        )
         action_dim = 4
-        state_dim = int(fc1_weight.shape[1]) - action_dim
-        self.model = WorldModel(state_dim=state_dim, action_dim=action_dim, hidden=hidden).to(self.device)
-        self.model.load_state_dict(state_dict)
+        if self.is_temporal_world_model:
+            state_dict = ckpt.get("world_model")
+            if state_dict is None:
+                raise KeyError("Temporal Dreamer checkpoint is missing 'world_model'.")
+            self.rssm_config = RSSMConfig.from_dict(ckpt.get("world_model_config"))
+            action_dim = int(self.rssm_config.action_dim)
+            state_dim = int(ckpt.get("base_world_state_dim", 28))
+            self.policy_observation_dim = int(
+                ckpt.get("policy_observation_dim", self.rssm_config.observation_dim)
+            )
+            if self.policy_observation_dim != self.rssm_config.observation_dim:
+                raise ValueError(
+                    "RSSM policy observation and world-model observation dimensions differ: "
+                    f"{self.policy_observation_dim} != {self.rssm_config.observation_dim}"
+                )
+            self.model = TemporalRSSMWorldModel(self.rssm_config).to(self.device)
+            self.model.load_state_dict(state_dict)
+            checkpoint_schema = "simlingo_temporal_rssm_v2"
+        else:
+            state_dict = ckpt.get("model")
+            checkpoint_schema = "simlingo_guard"
+            if state_dict is None and "world_model" in ckpt:
+                state_dict = ckpt["world_model"]
+                checkpoint_schema = "youma_dreamer_ppo"
+            if state_dict is None:
+                raise KeyError("Dreamer checkpoint must contain either 'model' or 'world_model'.")
+
+            fc1_weight = state_dict.get("fc1.weight")
+            if fc1_weight is None:
+                raise KeyError("Dreamer checkpoint is missing world model layer 'fc1.weight'.")
+            hidden = int(fc1_weight.shape[0])
+            state_dim = int(fc1_weight.shape[1]) - action_dim
+            self.model = WorldModel(
+                state_dim=state_dim,
+                action_dim=action_dim,
+                hidden=hidden,
+            ).to(self.device)
+            self.model.load_state_dict(state_dict)
+            self.policy_observation_dim = state_dim
         self.model.eval()
+        utility_state = ckpt.get("utility_calibrator")
+        utility_metadata = rssm_metadata.get("utility_calibrator") or {}
+        if utility_state is not None:
+            if not self.is_temporal_world_model or self.rssm_config is None:
+                raise ValueError(
+                    "A pairwise utility calibrator requires a temporal RSSM checkpoint."
+                )
+            utility_type = str(
+                ckpt.get(
+                    "utility_model_type",
+                    utility_metadata.get("model_type", ""),
+                )
+            )
+            if utility_type != RSSM_UTILITY_MODEL_TYPE:
+                raise ValueError(
+                    "Unsupported RSSM utility calibrator type: " + utility_type
+                )
+            self.rssm_utility_calibrator = PairwiseUtilityCalibrator(
+                feature_dim=self.rssm_config.feature_dim,
+                observation_dim=int(
+                    utility_metadata.get("observation_dim", 0)
+                ),
+                hidden_dim=int(utility_metadata.get("hidden_dim", 32)),
+                output_scale=float(utility_metadata.get("output_scale", 1.5)),
+            ).to(self.device)
+            self.rssm_utility_calibrator.load_state_dict(utility_state)
+            self.rssm_utility_calibrator.eval()
+            configured_indices = utility_metadata.get("observation_indices")
+            if configured_indices is None:
+                configured_indices = list(range(
+                    self.rssm_utility_calibrator.observation_dim
+                ))
+            self.rssm_utility_observation_indices = tuple(
+                int(index) for index in configured_indices
+            )
+            if (
+                len(self.rssm_utility_observation_indices)
+                != self.rssm_utility_calibrator.observation_dim
+                or any(
+                    index < 0 or index >= self.rssm_config.observation_dim
+                    for index in self.rssm_utility_observation_indices
+                )
+            ):
+                raise ValueError(
+                    "RSSM utility observation indices do not match checkpoint metadata."
+                )
+            self.rssm_utility_blend = _clip(
+                float(utility_metadata.get("blend", 1.0)), 0.0, 1.0
+            )
         self.policy: Optional[ActorCritic] = None
         self.policy_state_dim = state_dim
         self.policy_action_dim = action_dim
         self.policy_input_semantics = str(ckpt.get("policy_input_semantics", "world_state_v1"))
+        self.world_model_state_semantics = str(
+            ckpt.get("world_model_state_semantics", "raw_world_state_v1")
+        )
         self.policy_action_semantics = str(
             ckpt.get("policy_action_semantics", "simlingo_residual_with_learned_gate_v1")
         )
@@ -260,6 +495,15 @@ class DreamerGuard:
             ).to(self.device)
             self.policy.load_state_dict(policy_dict)
             self.policy.eval()
+            if not self.is_temporal_world_model:
+                self.policy_observation_dim = self.policy_state_dim
+            else:
+                expected_actor_dim = self.policy_observation_dim + self.rssm_config.feature_dim
+                if self.policy_state_dim != expected_actor_dim:
+                    raise ValueError(
+                        "Temporal Dreamer actor input does not match observation + latent feature: "
+                        f"{self.policy_state_dim} != {expected_actor_dim}"
+                    )
         self.state_dim = state_dim
         self.checkpoint_schema = checkpoint_schema
 
@@ -274,6 +518,22 @@ class DreamerGuard:
             device=self.device,
         ).clamp_min(1e-6)
         self.policy_state_mean, self.policy_state_std = self._policy_normalizer_from_checkpoint(ckpt)
+        self.world_observation_mean = torch.as_tensor(
+            ckpt.get(
+                "world_observation_mean",
+                self.policy_state_mean.detach().cpu().numpy(),
+            ),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.world_observation_std = torch.as_tensor(
+            ckpt.get(
+                "world_observation_std",
+                self.policy_state_std.detach().cpu().numpy(),
+            ),
+            dtype=torch.float32,
+            device=self.device,
+        ).clamp_min(1e-6)
         self.action_mean = torch.as_tensor(
             ckpt.get("action_mean", np.zeros(action_dim, dtype=np.float32)),
             dtype=torch.float32,
@@ -447,6 +707,8 @@ class DreamerGuard:
         loc_y = 0.0
         light_state = "none"
         front_vehicle_m = 80.0
+        front_vehicle_id = -1
+        front_vehicle_clearance_m = 80.0
         nearest_vehicle_m = 80.0
         front_vehicle_rel_speed_mps = 0.0
         nearest_walker_m = 80.0
@@ -471,6 +733,10 @@ class DreamerGuard:
         right_oncoming_m = 80.0
         left_oncoming_rel_speed_mps = 0.0
         right_oncoming_rel_speed_mps = 0.0
+        current_oncoming_distance_m = 80.0
+        current_oncoming_closing_speed_mps = 0.0
+        current_oncoming_ttc_s = 99.0
+        current_oncoming_actor_id = -1
         current_lane_ok = True
         left_lane_available = True
         right_lane_available = True
@@ -480,6 +746,11 @@ class DreamerGuard:
         hero_lane_key = None
         left_lane_key = None
         right_lane_key = None
+        ego_road_id = 0
+        ego_lane_id = 0
+        ego_lane_width_m = 3.5
+        ego_lane_center_offset_m = 0.0
+        nearby_vehicles = []
 
         if hero is not None and getattr(hero, "is_alive", False):
             transform = hero.get_transform()
@@ -517,6 +788,20 @@ class DreamerGuard:
                     current_lane_ok, _ = lane_ok(waypoint)
                     hero_lane_key = lane_key(waypoint)
                     if waypoint is not None:
+                        ego_road_id = int(getattr(waypoint, "road_id", 0))
+                        ego_lane_id = int(getattr(waypoint, "lane_id", 0))
+                        ego_lane_width_m = float(getattr(waypoint, "lane_width", 3.5))
+                        try:
+                            lane_transform = waypoint.transform
+                            lane_center = lane_transform.location
+                            lane_right = lane_transform.get_right_vector()
+                            ego_lane_center_offset_m = float(
+                                (hero_loc.x - lane_center.x) * lane_right.x
+                                + (hero_loc.y - lane_center.y) * lane_right.y
+                                + (hero_loc.z - lane_center.z) * lane_right.z
+                            )
+                        except Exception:
+                            ego_lane_center_offset_m = 0.0
                         left_lane = waypoint.get_left_lane()
                         right_lane = waypoint.get_right_lane()
                         left_lane_available, left_lane_width = lane_ok(left_lane)
@@ -532,6 +817,10 @@ class DreamerGuard:
                 forward = transform.get_forward_vector()
                 right = transform.get_right_vector()
                 hero_longitudinal_speed = _actor_longitudinal_speed(hero, forward)
+                try:
+                    hero_half_length = float(hero.bounding_box.extent.x)
+                except Exception:
+                    hero_half_length = 2.4
                 hero_id = hero.id
                 for actor in actors:
                     if not getattr(actor, "is_alive", False) or actor.id == hero_id:
@@ -551,8 +840,11 @@ class DreamerGuard:
                         actor_long_speed = _actor_longitudinal_speed(actor, forward)
                         actor_rel_long_speed = actor_long_speed - hero_longitudinal_speed
                         actor_heading_dot = 1.0
+                        actor_transform = None
+                        actor_forward = None
                         try:
-                            actor_forward = actor.get_transform().get_forward_vector()
+                            actor_transform = actor.get_transform()
+                            actor_forward = actor_transform.get_forward_vector()
                             actor_heading_dot = float(
                                 actor_forward.x * forward.x
                                 + actor_forward.y * forward.y
@@ -560,7 +852,21 @@ class DreamerGuard:
                             )
                         except Exception:
                             actor_heading_dot = 1.0
-                        is_oncoming = actor_heading_dot < -0.25 and actor_long_speed < -0.5
+                        actor_half_along = 2.4
+                        try:
+                            actor_right = actor_transform.get_right_vector()
+                            extent = actor.bounding_box.extent
+                            actor_half_along = float(
+                                abs(actor_forward.x * forward.x + actor_forward.y * forward.y) * extent.x
+                                + abs(actor_right.x * forward.x + actor_right.y * forward.y) * extent.y
+                            )
+                        except Exception:
+                            pass
+                        longitudinal_clearance_m = max(
+                            0.0,
+                            abs(float(forward_m)) - hero_half_length - actor_half_along,
+                        )
+                        is_oncoming = _is_opposing_vehicle_heading(actor_heading_dot)
                         nearest_vehicle_m = min(nearest_vehicle_m, dist)
                         if -6.2 <= lateral_m <= -0.8:
                             if forward_m >= 0.0 and is_oncoming and forward_m < left_oncoming_m:
@@ -594,6 +900,21 @@ class DreamerGuard:
                         except Exception:
                             actor_lane_key = None
 
+                        if dist <= 80.0:
+                            nearby_vehicles.append({
+                                "id": int(actor.id),
+                                "forward_m": float(forward_m),
+                                "lateral_m": float(lateral_m),
+                                "distance_m": float(dist),
+                                "longitudinal_clearance_m": float(longitudinal_clearance_m),
+                                "heading_dot": float(actor_heading_dot),
+                                "relative_longitudinal_speed_mps": float(actor_rel_long_speed),
+                                "closing_speed_mps": float(max(0.0, -actor_rel_long_speed)),
+                                "is_oncoming": bool(is_oncoming),
+                                "road_id": int(actor_lane_key[0]) if actor_lane_key is not None else 0,
+                                "lane_id": int(actor_lane_key[1]) if actor_lane_key is not None else 0,
+                            })
+
                         if hero_lane_key is not None and actor_lane_key is not None:
                             same_lane = actor_lane_key == hero_lane_key
                             side_bucket = 0
@@ -609,8 +930,24 @@ class DreamerGuard:
                             elif 1.25 <= lateral_m <= 5.8:
                                 side_bucket = 1
 
+                        current_lane_match = bool(
+                            same_lane
+                            or abs(float(lateral_m)) <= max(1.5, 0.48 * float(ego_lane_width_m))
+                        )
+                        if (
+                            forward_m >= 0.0
+                            and is_oncoming
+                            and current_lane_match
+                            and forward_m < current_oncoming_distance_m
+                        ):
+                            current_oncoming_distance_m = float(forward_m)
+                            current_oncoming_closing_speed_mps = float(max(0.0, -actor_rel_long_speed))
+                            current_oncoming_actor_id = int(actor.id)
+
                         if forward_m > 0.0 and same_lane and forward_m < front_vehicle_m:
                             front_vehicle_m = forward_m
+                            front_vehicle_id = int(actor.id)
+                            front_vehicle_clearance_m = float(longitudinal_clearance_m)
                             front_vehicle_rel_speed_mps = actor_rel_long_speed
                         if side_bucket == -1:
                             if forward_m >= 0.0 and forward_m < left_front_m:
@@ -691,9 +1028,17 @@ class DreamerGuard:
                 return 99.0
             return float(dist) / max(0.1, closing)
 
+        if current_oncoming_closing_speed_mps > 0.5:
+            current_oncoming_ttc_s = float(current_oncoming_distance_m) / max(
+                0.1,
+                float(current_oncoming_closing_speed_mps),
+            )
+
         context = {
             "speed": speed,
             "front_vehicle_m": front_vehicle_m,
+            "front_vehicle_id": front_vehicle_id,
+            "front_vehicle_clearance_m": front_vehicle_clearance_m,
             "nearest_vehicle_m": nearest_vehicle_m,
             "nearest_walker_m": nearest_walker_m,
             "nearest_bike_m": nearest_bike_m,
@@ -711,11 +1056,21 @@ class DreamerGuard:
             "right_oncoming_rel_speed_mps": right_oncoming_rel_speed_mps,
             "left_oncoming_ttc_s": oncoming_ttc(left_oncoming_m, left_oncoming_rel_speed_mps),
             "right_oncoming_ttc_s": oncoming_ttc(right_oncoming_m, right_oncoming_rel_speed_mps),
+            "current_oncoming_distance": current_oncoming_distance_m,
+            "current_oncoming_distance_m": current_oncoming_distance_m,
+            "current_oncoming_closing_speed_mps": current_oncoming_closing_speed_mps,
+            "current_oncoming_ttc_s": current_oncoming_ttc_s,
+            "current_oncoming_actor_id": current_oncoming_actor_id,
             "left_clear_m": min(left_front_m, left_rear_m),
             "right_clear_m": min(right_front_m, right_rear_m),
             "left_ttc_s": self._side_ttc(-1, left_front_m, left_rear_m, left_front_rel_speed_mps, left_rear_rel_speed_mps),
             "right_ttc_s": self._side_ttc(1, right_front_m, right_rear_m, right_front_rel_speed_mps, right_rear_rel_speed_mps),
             "current_lane_ok": float(current_lane_ok),
+            "ego_road_id": int(ego_road_id),
+            "ego_lane_id": int(ego_lane_id),
+            "ego_lane_width_m": float(ego_lane_width_m),
+            "ego_lane_center_offset_m": float(ego_lane_center_offset_m),
+            "nearby_vehicles": sorted(nearby_vehicles, key=lambda row: row["distance_m"])[:16],
             "left_lane_available": float(left_lane_available),
             "right_lane_available": float(right_lane_available),
             "left_lane_width": left_lane_width,
@@ -1028,7 +1383,7 @@ class DreamerGuard:
 
     @staticmethod
     def _default_policy_state_scale(dim: int) -> np.ndarray:
-        scale = np.ones(max(dim, 44), dtype=np.float32)
+        scale = np.ones(max(dim, 49), dtype=np.float32)
         scale[0] = 1000.0
         scale[1] = 1000.0
         scale[2] = 15.0
@@ -1049,32 +1404,37 @@ class DreamerGuard:
                 scale[idx] = 80.0
             for idx in (36, 37, 40, 41):
                 scale[idx] = 20.0
+        if dim >= 49:
+            scale[42] = 80.0
+            scale[43] = 20.0
+            scale[44] = 20.0
         return scale[:dim]
 
     def _policy_normalizer_from_checkpoint(self, ckpt: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+        observation_dim = self.policy_observation_dim
         if self.config.rl_policy_input_norm in ("0", "none", "raw", "off"):
-            mean = np.zeros(self.policy_state_dim, dtype=np.float32)
-            std = np.ones(self.policy_state_dim, dtype=np.float32)
+            mean = np.zeros(observation_dim, dtype=np.float32)
+            std = np.ones(observation_dim, dtype=np.float32)
         else:
             mean_raw = ckpt.get("policy_state_mean", ckpt.get("state_mean"))
             std_raw = ckpt.get("policy_state_std", ckpt.get("state_std"))
             if mean_raw is None or std_raw is None:
-                mean = np.zeros(self.policy_state_dim, dtype=np.float32)
-                std = self._default_policy_state_scale(self.policy_state_dim)
+                mean = np.zeros(observation_dim, dtype=np.float32)
+                std = self._default_policy_state_scale(observation_dim)
             else:
                 mean = np.asarray(mean_raw, dtype=np.float32).reshape(-1)
                 std = np.asarray(std_raw, dtype=np.float32).reshape(-1)
-                if mean.shape[0] < self.policy_state_dim:
-                    mean = np.pad(mean, (0, self.policy_state_dim - mean.shape[0]), mode="constant")
-                if std.shape[0] < self.policy_state_dim:
+                if mean.shape[0] < observation_dim:
+                    mean = np.pad(mean, (0, observation_dim - mean.shape[0]), mode="constant")
+                if std.shape[0] < observation_dim:
                     std = np.pad(
                         std,
-                        (0, self.policy_state_dim - std.shape[0]),
+                        (0, observation_dim - std.shape[0]),
                         mode="constant",
                         constant_values=1.0,
                     )
-                mean = mean[: self.policy_state_dim]
-                std = std[: self.policy_state_dim]
+                mean = mean[:observation_dim]
+                std = std[:observation_dim]
         return (
             torch.as_tensor(mean, dtype=torch.float32, device=self.device),
             torch.as_tensor(std, dtype=torch.float32, device=self.device).clamp_min(1e-6),
@@ -1111,6 +1471,8 @@ class DreamerGuard:
             "world_state_plus_simlingo_compact_context_v3",
             "world_state_plus_simlingo_temporal_context_v4",
             MAP_INVARIANT_POLICY_INPUT_SEMANTICS,
+            CURRENT_ONCOMING_POLICY_INPUT_SEMANTICS,
+            MAP_INVARIANT_CURRENT_ONCOMING_POLICY_INPUT_SEMANTICS,
         ):
             base = np.asarray(base_action, dtype=np.float32).reshape(-1)
             if base.shape[0] < 3:
@@ -1137,14 +1499,28 @@ class DreamerGuard:
                 float(context.get("right_lane_available", 1.0)),
             ], dtype=np.float32)
             policy_world_state = state_np[: self.state_dim].copy()
-            if self.policy_input_semantics == MAP_INVARIANT_POLICY_INPUT_SEMANTICS:
+            if self.policy_input_semantics in (
+                MAP_INVARIANT_POLICY_INPUT_SEMANTICS,
+                MAP_INVARIANT_CURRENT_ONCOMING_POLICY_INPUT_SEMANTICS,
+            ):
                 for index in MAP_INVARIANT_WORLD_STATE_INDICES:
                     if index < policy_world_state.shape[0]:
                         policy_world_state[index] = 0.0
             parts = [policy_world_state, base[:3], context_values]
             if self.policy_input_semantics in (
+                CURRENT_ONCOMING_POLICY_INPUT_SEMANTICS,
+                MAP_INVARIANT_CURRENT_ONCOMING_POLICY_INPUT_SEMANTICS,
+            ):
+                parts.append(np.asarray([
+                    float(context.get("current_oncoming_distance_m", 80.0)),
+                    float(context.get("current_oncoming_closing_speed_mps", 0.0)),
+                    float(context.get("current_oncoming_ttc_s", 99.0)),
+                ], dtype=np.float32))
+            if self.policy_input_semantics in (
                 "world_state_plus_simlingo_temporal_context_v4",
                 MAP_INVARIANT_POLICY_INPUT_SEMANTICS,
+                CURRENT_ONCOMING_POLICY_INPUT_SEMANTICS,
+                MAP_INVARIANT_CURRENT_ONCOMING_POLICY_INPUT_SEMANTICS,
             ):
                 previous = self.previous_rl_policy_action
                 if previous is None or np.asarray(previous).reshape(-1).shape[0] < 4:
@@ -1162,13 +1538,54 @@ class DreamerGuard:
         context: Dict[str, float],
     ) -> Tuple[torch.Tensor, np.ndarray]:
         state_np = self._policy_observation(state, base_action, context)
-        if state_np.shape[0] < self.policy_state_dim:
-            state_np = np.pad(state_np, (0, self.policy_state_dim - state_np.shape[0]), mode="constant")
-        elif state_np.shape[0] > self.policy_state_dim:
-            state_np = state_np[:self.policy_state_dim]
+        if state_np.shape[0] < self.policy_observation_dim:
+            state_np = np.pad(
+                state_np,
+                (0, self.policy_observation_dim - state_np.shape[0]),
+                mode="constant",
+            )
+        elif state_np.shape[0] > self.policy_observation_dim:
+            state_np = state_np[:self.policy_observation_dim]
         state_t = torch.as_tensor(state_np[None, :], dtype=torch.float32, device=self.device)
-        normalized = (state_t - self.policy_state_mean.reshape(1, -1)) / self.policy_state_std.reshape(1, -1)
-        return normalized, state_np
+        policy_normalized = (
+            state_t - self.policy_state_mean.reshape(1, -1)
+        ) / self.policy_state_std.reshape(1, -1)
+        if self.is_temporal_world_model:
+            world_normalized = (
+                state_t - self.world_observation_mean.reshape(1, -1)
+            ) / self.world_observation_std.reshape(1, -1)
+            self.rssm_current_observation_normalized = world_normalized
+            if self.rssm_state is None:
+                self.rssm_state = self.model.observe_initial(
+                    world_normalized,
+                    deterministic=True,
+                )
+            else:
+                previous_action = self.previous_rssm_action
+                if previous_action is None:
+                    previous_action = np.asarray(
+                        [base_action[0], base_action[1], base_action[2], 0.0],
+                        dtype=np.float32,
+                    )
+                action_t = torch.as_tensor(
+                    np.asarray(previous_action, dtype=np.float32).reshape(1, -1),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                action_t = (
+                    action_t - self.action_mean.reshape(1, -1)
+                ) / self.action_std.reshape(1, -1)
+                self.rssm_state, _ = self.model.obs_step(
+                    self.rssm_state,
+                    action_t,
+                    world_normalized,
+                    deterministic=True,
+                )
+            policy_normalized = torch.cat(
+                [policy_normalized, self.model.feature(self.rssm_state)],
+                dim=-1,
+            )
+        return policy_normalized, state_np
 
     def _policy_to_control_action(self, base_action: np.ndarray, policy_action: np.ndarray) -> np.ndarray:
         base = np.asarray(base_action, dtype=np.float32).reshape(-1)
@@ -1224,6 +1641,171 @@ class DreamerGuard:
         blended[2] = _clip(float(blended[2]), 0.0, 1.0)
         return np.asarray([blended[0], blended[1], blended[2], intervention], dtype=np.float32)
 
+    def _decode_policy_raw_action(self, raw_action: np.ndarray) -> np.ndarray:
+        """Decode one unconstrained actor sample using checkpoint semantics."""
+        raw = np.asarray(raw_action, dtype=np.float32).reshape(-1)
+        if raw.shape[0] < 4:
+            raw = np.pad(raw, (0, 4 - raw.shape[0]), mode="constant")
+        if self.policy_action_semantics == (
+            "simlingo_signed_longitudinal_target_with_learned_gate_v3"
+        ):
+            signed_longitudinal = math.tanh(float(raw[1]) - float(raw[2]))
+            return np.asarray([
+                math.tanh(float(raw[0])),
+                max(0.0, signed_longitudinal),
+                max(0.0, -signed_longitudinal),
+                1.0 / (1.0 + math.exp(-float(raw[3]))),
+            ], dtype=np.float32)
+        return np.asarray([
+            math.tanh(float(raw[0])),
+            1.0 / (1.0 + math.exp(-float(raw[1]))),
+            1.0 / (1.0 + math.exp(-float(raw[2]))),
+            1.0 / (1.0 + math.exp(-float(raw[3]))),
+        ], dtype=np.float32)
+
+    def _rssm_policy_shooting_actions(
+        self,
+        base_action: np.ndarray,
+        policy_row: Dict[str, Any],
+    ) -> Tuple[List[np.ndarray], List[Dict[str, Any]]]:
+        """Build deterministic sigma-point proposals from the learned actor.
+
+        This is model-based action shooting, not a recovery controller. The
+        proposal directions and scales come from the actor distribution and
+        every proposal is subsequently ranked by the learned RSSM utility.
+        No traffic geometry, blocked-time threshold, or hand-written safety
+        decision is used here.
+        """
+        base = np.asarray(base_action, dtype=np.float32).reshape(-1)[:4]
+        actor_control = np.asarray(policy_row["action"], dtype=np.float32).reshape(-1)[:4]
+        actions = [base.copy(), actor_control.copy()]
+        meta: List[Dict[str, Any]] = [
+            {"kind": "rssm_simlingo_base", "side": 0},
+            {"kind": "rssm_actor_mean", "side": 0},
+        ]
+        if (
+            not self.is_temporal_world_model
+            or not getattr(self, "rssm_actor_sigma_shooting", False)
+        ):
+            return actions, meta
+
+        raw_mean = np.asarray(policy_row["raw_action"], dtype=np.float32).reshape(-1)[:4]
+        learned_std = (
+            self.policy.log_std.detach().exp().float().cpu().numpy().reshape(-1)[:4]
+        )
+        if raw_mean.shape[0] < 4 or learned_std.shape[0] < 4:
+            return actions, meta
+
+        # Unscented-style directions in the actor's own continuous action
+        # distribution. Coupling the two longitudinal logits preserves the
+        # checkpoint's signed throttle/brake representation.
+        directions = (
+            ("steer_left", np.asarray([-1.0, 0.0, 0.0, 0.0], dtype=np.float32)),
+            ("steer_right", np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)),
+            ("longitudinal_positive", np.asarray([0.0, 1.0, -1.0, 0.0], dtype=np.float32)),
+            ("longitudinal_negative", np.asarray([0.0, -1.0, 1.0, 0.0], dtype=np.float32)),
+            ("left_positive", np.asarray([-1.0, 1.0, -1.0, 0.0], dtype=np.float32)),
+            ("right_positive", np.asarray([1.0, 1.0, -1.0, 0.0], dtype=np.float32)),
+        )
+        sigma_scales = (1.0, 2.0)
+        seen = {tuple(np.round(action, 6)) for action in actions}
+        for sigma_scale in sigma_scales:
+            for name, direction in directions:
+                raw_candidate = raw_mean + sigma_scale * learned_std * direction
+                policy_candidate = self._decode_policy_raw_action(raw_candidate)
+                control_candidate = self._policy_to_control_action(
+                    base,
+                    policy_candidate,
+                )
+                key = tuple(np.round(control_candidate, 6))
+                if key in seen:
+                    continue
+                seen.add(key)
+                actions.append(control_candidate)
+                meta.append({
+                    "kind": f"rssm_actor_sigma_{name}_{sigma_scale:g}",
+                    "side": -1 if control_candidate[0] < actor_control[0] else (
+                        1 if control_candidate[0] > actor_control[0] else 0
+                    ),
+                })
+        return actions, meta
+
+    def _rssm_closed_loop_controls(
+        self,
+        imagined: RSSMState,
+        world_observation: torch.Tensor,
+    ) -> torch.Tensor:
+        """Choose the next imagined control for each planning branch.
+
+        Branch zero is the learned SimLingo continuation contained in the
+        predicted observation.  Every other branch replans with the actor from
+        its own latent future.  Only the first selected action is ever executed
+        in CARLA; the whole tree is rebuilt on the next real observation.
+        """
+
+        raw_observation = (
+            world_observation * self.world_observation_std.reshape(1, -1)
+            + self.world_observation_mean.reshape(1, -1)
+        )
+        count = raw_observation.shape[0]
+        base = raw_observation[:, 28:31].clone()
+        base[:, 0].clamp_(-1.0, 1.0)
+        base[:, 1:].clamp_(0.0, 1.0)
+        controls = torch.cat(
+            [
+                base,
+                torch.zeros(count, 1, dtype=base.dtype, device=base.device),
+            ],
+            dim=-1,
+        )
+        if count <= 1 or self.policy is None:
+            return controls
+
+        policy_observation = (
+            raw_observation - self.policy_state_mean.reshape(1, -1)
+        ) / self.policy_state_std.reshape(1, -1)
+        actor_input = torch.cat(
+            [policy_observation, self.model.feature(imagined)], dim=-1
+        )
+        mean, _, _ = self.policy(actor_input)
+        if self.policy_action_semantics == (
+            "simlingo_signed_longitudinal_target_with_learned_gate_v3"
+        ):
+            target_steer = torch.tanh(mean[:, 0:1])
+            target_longitudinal = torch.tanh(mean[:, 1:2] - mean[:, 2:3])
+            gate = torch.sigmoid(mean[:, 3:4])
+            steering = base[:, 0:1] + gate * (target_steer - base[:, 0:1])
+            base_longitudinal = base[:, 1:2] - base[:, 2:3]
+            longitudinal = base_longitudinal + gate * (
+                target_longitudinal - base_longitudinal
+            )
+            actor_controls = torch.cat(
+                [
+                    steering.clamp(-1.0, 1.0),
+                    torch.relu(longitudinal).clamp(0.0, 1.0),
+                    torch.relu(-longitudinal).clamp(0.0, 1.0),
+                    gate,
+                ],
+                dim=-1,
+            )
+        else:
+            bounded = self.policy._squash(mean)
+            gate = bounded[:, 3:4]
+            actor_controls = torch.cat(
+                [
+                    base[:, :3] + gate * (bounded[:, :3] - base[:, :3]),
+                    gate,
+                ],
+                dim=-1,
+            )
+            actor_controls[:, 0].clamp_(-1.0, 1.0)
+            actor_controls[:, 1:3].clamp_(0.0, 1.0)
+
+        # The reference branch must remain a pure SimLingo rollout.  The
+        # actor is only allowed to close the loop for candidate futures.
+        controls[1:] = actor_controls[1:]
+        return controls
+
     @torch.no_grad()
     def rl_policy_action(
         self,
@@ -1248,13 +1830,7 @@ class DreamerGuard:
         bounded, log_prob, value, raw = self.policy.act(state_t, deterministic=deterministic)
         raw_action = raw.reshape(-1).detach().float().cpu().numpy().astype(np.float32)
         if self.policy_action_semantics == "simlingo_signed_longitudinal_target_with_learned_gate_v3":
-            signed_longitudinal = math.tanh(float(raw_action[1]) - float(raw_action[2]))
-            policy_action = np.asarray([
-                math.tanh(float(raw_action[0])),
-                max(0.0, signed_longitudinal),
-                max(0.0, -signed_longitudinal),
-                1.0 / (1.0 + math.exp(-float(raw_action[3]))),
-            ], dtype=np.float32)
+            policy_action = self._decode_policy_raw_action(raw_action)
         else:
             policy_action = bounded.reshape(-1).detach().float().cpu().numpy().astype(np.float32)
         control_action = self._policy_to_control_action(base_action, policy_action)
@@ -1398,12 +1974,160 @@ class DreamerGuard:
     @torch.no_grad()
     def predict(self, state: np.ndarray, actions: Iterable[np.ndarray]) -> List[Dict[str, float]]:
         actions_np = np.asarray(list(actions), dtype=np.float32)
+        if self.is_temporal_world_model:
+            if self.rssm_state is None:
+                raise RuntimeError("RSSM prediction requested before observing the current state.")
+            action_t = torch.as_tensor(actions_np, dtype=torch.float32, device=self.device)
+            action_t = (
+                action_t - self.action_mean.reshape(1, -1)
+            ) / self.action_std.reshape(1, -1)
+            count = actions_np.shape[0]
+            repeated = RSSMState(
+                deter=self.rssm_state.deter.repeat(count, 1),
+                stoch=self.rssm_state.stoch.repeat(count, 1),
+                logits=self.rssm_state.logits.repeat(count, 1, 1),
+            )
+            imagined = repeated
+            risks = []
+            progress = []
+            utility_calibrator = getattr(
+                self, "rssm_utility_calibrator", None
+            )
+            collect_utility_features = utility_calibrator is not None
+            utility_features = []
+            utility_continuation = []
+            continuation = torch.ones(count, dtype=torch.float32, device=self.device)
+            discount = 1.0
+            base_action_t = action_t[0:1].repeat(count, 1)
+            closed_loop_rollout = bool(
+                getattr(self, "rssm_closed_loop_actor_rollout", False)
+                and self.policy is not None
+                and self.rssm_current_observation_normalized is not None
+            )
+            imagined_observation = None
+            rollout_control_t = torch.as_tensor(
+                actions_np,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            if closed_loop_rollout:
+                imagined_observation = (
+                    self.rssm_current_observation_normalized.repeat(count, 1)
+                )
+            for step in range(self.rssm_planning_horizon):
+                if closed_loop_rollout and step > 0:
+                    rollout_control_t = self._rssm_closed_loop_controls(
+                        imagined,
+                        imagined_observation,
+                    )
+                    rollout_action_t = (
+                        rollout_control_t - self.action_mean.reshape(1, -1)
+                    ) / self.action_std.reshape(1, -1)
+                else:
+                    # Legacy RSSM checkpoints retain their one-step proposal:
+                    # after the configured commitment they return to the
+                    # current SimLingo command exactly as before.
+                    rollout_action_t = (
+                        action_t
+                        if step < self.rssm_candidate_commit_horizon
+                        else base_action_t
+                    )
+                    if not closed_loop_rollout:
+                        rollout_control_t = (
+                            rollout_action_t * self.action_std.reshape(1, -1)
+                            + self.action_mean.reshape(1, -1)
+                        )
+                imagined, prediction = self.model.imagine_step(
+                    imagined,
+                    rollout_action_t,
+                    deterministic=True,
+                )
+                step_risk = torch.sigmoid(prediction["risk_logit"])
+                step_progress = symexp(prediction["progress_symlog"])
+                if collect_utility_features:
+                    utility_features.append(self.model.feature(imagined))
+                    utility_continuation.append(continuation)
+                risks.append(step_risk * continuation)
+                progress.append(step_progress * continuation * discount)
+                continuation = continuation * torch.sigmoid(
+                    prediction["continuation_logit"]
+                )
+                discount *= self.rssm_planning_discount
+                if closed_loop_rollout:
+                    imagined_observation = (
+                        imagined_observation + prediction["observation_delta"]
+                    )
+                    raw_observation = (
+                        imagined_observation
+                        * self.world_observation_std.reshape(1, -1)
+                        + self.world_observation_mean.reshape(1, -1)
+                    )
+                    # The final four observation slots encode the previous
+                    # executed control.  The RSSM predicts persistence there,
+                    # so explicitly inject the branch-specific imagined action.
+                    raw_observation = torch.cat(
+                        [raw_observation[:, :-4], rollout_control_t], dim=-1
+                    )
+                    imagined_observation = (
+                        raw_observation
+                        - self.world_observation_mean.reshape(1, -1)
+                    ) / self.world_observation_std.reshape(1, -1)
+            # Safety is a worst-future cost, while useful motion accumulates.
+            # This follows the separation between safety cost and reward used
+            # by safe world-model planning, without a hand-written veto.
+            risk_t = torch.stack(risks).amax(dim=0)
+            progress_t = torch.stack(progress).sum(dim=0)
+            utility_residual_t = torch.zeros_like(progress_t)
+            if collect_utility_features:
+                pooled = discounted_feature_pool(
+                    torch.stack(utility_features, dim=1),
+                    torch.stack(utility_continuation, dim=1),
+                    self.rssm_planning_discount,
+                )
+                base_pooled = pooled[0:1].repeat(count, 1)
+                control_delta_t = torch.as_tensor(
+                    actions_np[:, :3] - actions_np[0:1, :3],
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                current_observation_t = None
+                if utility_calibrator.observation_dim:
+                    current_observation_t = (
+                        self.rssm_current_observation_normalized[
+                            :, self.rssm_utility_observation_indices
+                        ].repeat(count, 1)
+                    )
+                utility_residual_t = utility_calibrator(
+                    base_pooled,
+                    pooled,
+                    progress_t - progress_t[0],
+                    risk_t - risk_t[0],
+                    control_delta_t,
+                    current_observation_t,
+                ) * self.rssm_utility_blend
+                utility_residual_t[0] = 0.0
+            risk_np = risk_t.detach().float().cpu().numpy()
+            progress_np = progress_t.detach().float().cpu().numpy()
+            utility_residual_np = (
+                utility_residual_t.detach().float().cpu().numpy()
+            )
+            return self._scored_predictions(
+                actions_np,
+                risk_np,
+                progress_np,
+                utility_residual_np=utility_residual_np,
+            )
+
         state = np.asarray(state, dtype=np.float32).reshape(-1)
         if state.shape[0] < self.state_dim:
             state = np.pad(state, (0, self.state_dim - state.shape[0]), mode="constant")
         elif state.shape[0] > self.state_dim:
             state = state[:self.state_dim]
         state_np = np.repeat(state[None, :], actions_np.shape[0], axis=0).astype(np.float32)
+        if self.world_model_state_semantics == "map_invariant_normalized_one_step_v2":
+            for column in MAP_INVARIANT_WORLD_STATE_INDICES:
+                if column < state_np.shape[1]:
+                    state_np[:, column] = 0.0
         state_t = torch.as_tensor(state_np, dtype=torch.float32, device=self.device)
         action_t = torch.as_tensor(actions_np, dtype=torch.float32, device=self.device)
         state_t = (state_t - self.state_mean) / self.state_std
@@ -1412,23 +2136,56 @@ class DreamerGuard:
         progress = progress_hat * self.progress_std.reshape(1) + self.progress_mean.reshape(1)
         risk_np = risk_hat.squeeze(-1).detach().float().cpu().numpy()
         progress_np = progress.squeeze(-1).detach().float().cpu().numpy()
+        return self._scored_predictions(actions_np, risk_np, progress_np)
+
+    def _scored_predictions(
+        self,
+        actions_np: np.ndarray,
+        risk_np: np.ndarray,
+        progress_np: np.ndarray,
+        utility_residual_np: Optional[np.ndarray] = None,
+    ) -> List[Dict[str, float]]:
         rows = []
         base = actions_np[0]
         meta = getattr(self, "_candidate_meta", [])
         for idx, action in enumerate(actions_np):
             row_meta = meta[idx] if idx < len(meta) else {}
             action_delta = float(np.abs(action[:3] - base[:3]).mean())
+            risk = float(risk_np[idx])
+            progress = float(progress_np[idx])
+            utility_residual = (
+                float(utility_residual_np[idx])
+                if utility_residual_np is not None
+                else 0.0
+            )
+            if self.is_temporal_world_model:
+                # Convex risk utility: when the imagined future is already
+                # dangerous, a further increase matters more than the same
+                # increase in free-flow driving. This remains a continuous
+                # learned objective, not a TTC/clearance veto or safety guard.
+                risk_cost = risk + self.rssm_risk_curvature * risk * risk
+                progress_weight = self.rssm_progress_weight
+                risk_weight = self.rssm_risk_weight
+                action_penalty = self.rssm_action_penalty
+            else:
+                risk_cost = risk
+                progress_weight = self.config.w_progress
+                risk_weight = self.config.w_risk
+                action_penalty = self.config.action_penalty
             score = (
-                self.config.w_progress * float(progress_np[idx])
-                - self.config.w_risk * float(risk_np[idx])
-                - self.config.action_penalty * action_delta
+                progress_weight * progress
+                - risk_weight * risk_cost
+                - action_penalty * action_delta
+                + utility_residual
             )
             rows.append({
                 "candidate_index": idx,
                 "action": action,
-                "risk": float(risk_np[idx]),
-                "progress": float(progress_np[idx]),
+                "risk": risk,
+                "risk_cost": float(risk_cost),
+                "progress": progress,
                 "score": float(score),
+                "learned_utility_residual": utility_residual,
                 "action_delta": action_delta,
                 "kind": row_meta.get("kind", "model"),
                 "side": int(row_meta.get("side", 0)),
@@ -1590,10 +2347,62 @@ class DreamerGuard:
             if policy_row is None:
                 return control, {"enabled": False, "mode": "rl_noguard", "variant": self.config.variant}
             chosen_action = policy_row["action"]
-            scored = self.predict(state, [base_action, chosen_action])
+            proposed_action = chosen_action.copy()
+            planning_actions = [base_action, chosen_action]
+            planning_meta = [
+                {"kind": "rssm_simlingo_base", "side": 0},
+                {"kind": "rssm_actor_mean", "side": 0},
+            ]
+            if self.is_temporal_world_model:
+                planning_actions, planning_meta = self._rssm_policy_shooting_actions(
+                    base_action,
+                    policy_row,
+                )
+            self._candidate_meta = planning_meta
+            scored = self.predict(state, planning_actions)
             base_score = scored[0]
             chosen_score = scored[1] if len(scored) > 1 else scored[0]
-            intervention = float(policy_row["intervention_strength"])
+            actor_intervention = float(policy_row["intervention_strength"])
+            intervention = actor_intervention
+            score_advantage = float(chosen_score["score"] - base_score["score"])
+            authority_confidence = 1.0
+            model_selected_index = 1
+            if self.is_temporal_world_model:
+                selected = max(scored, key=lambda row: float(row["score"]))
+                model_selected_index = int(selected["candidate_index"])
+                if model_selected_index == 0:
+                    chosen_action = base_action.copy()
+                    chosen_score = base_score
+                    intervention = 0.0
+                    score_advantage = 0.0
+                    authority_confidence = 0.0
+                else:
+                    chosen_score = selected
+                    proposed_action = np.asarray(
+                        chosen_score["action"], dtype=np.float32
+                    ).copy()
+                    actor_intervention = float(
+                        _clip(proposed_action[3], 0.0, 1.0)
+                    )
+                    score_advantage = max(
+                        0.0,
+                        float(chosen_score["score"] - base_score["score"]),
+                    )
+                    authority_confidence = rssm_authority_confidence(
+                        score_advantage,
+                        self.rssm_authority_temperature,
+                    )
+                    intervention = actor_intervention * authority_confidence
+                    chosen_action = _scale_control_authority(
+                        base_action,
+                        proposed_action,
+                        authority_confidence,
+                        intervention,
+                    )
+                # Feed the action that was actually executed back into the
+                # recurrent model on the next tick. The arbiter is learned; no
+                # clearance/TTC guard or fixed safety threshold is applied.
+                self.previous_rssm_action = chosen_action.copy()
             control_delta = float(np.max(np.abs(chosen_action[:3] - base_action[:3])))
             has_control_delta = control_delta > 1e-6
             # This threshold affects display/logging only. The continuous blend
@@ -1605,14 +2414,30 @@ class DreamerGuard:
                 "variant": self.config.variant,
                 "would_override": applied,
                 "applied": applied,
-                "candidate_index": -1,
+                "candidate_index": model_selected_index if self.is_temporal_world_model else -1,
                 "base_risk": float(base_score["risk"]),
                 "chosen_risk": float(chosen_score["risk"]),
                 "base_progress": float(base_score["progress"]),
                 "chosen_progress": float(chosen_score["progress"]),
-                "chosen_kind": "rl_learned_complement"
-                if self.config.rl_action_space != "absolute"
-                else "rl_learned_absolute_complement",
+                "base_utility_residual": float(
+                    base_score.get("learned_utility_residual", 0.0)
+                ),
+                "chosen_utility_residual": float(
+                    chosen_score.get("learned_utility_residual", 0.0)
+                ),
+                "chosen_kind": (
+                    "rssm_simlingo_base"
+                    if self.is_temporal_world_model and model_selected_index == 0
+                    else (
+                        str(chosen_score.get("kind", "rssm_model_based_complement"))
+                        if self.is_temporal_world_model
+                        else (
+                            "rl_learned_complement"
+                            if self.config.rl_action_space != "absolute"
+                            else "rl_learned_absolute_complement"
+                        )
+                    )
+                ),
                 "chosen_side": -1 if float(chosen_action[0]) < float(base_action[0]) - 0.04 else (1 if float(chosen_action[0]) > float(base_action[0]) + 0.04 else 0),
                 "blocked_ticks": int(context.get("blocked_ticks", 0.0)),
                 "recovery_active_ticks": 0,
@@ -1620,6 +2445,8 @@ class DreamerGuard:
                 "recovery_finish_active_ticks": 0,
                 "recovery_side": 0,
                 "front_vehicle_m": float(context.get("front_vehicle_m", 80.0)),
+                "front_vehicle_id": int(context.get("front_vehicle_id", -1)),
+                "front_vehicle_clearance_m": float(context.get("front_vehicle_clearance_m", 80.0)),
                 "nearest_walker_m": float(context.get("nearest_walker_m", 80.0)),
                 "nearest_bike_m": float(context.get("nearest_bike_m", 80.0)),
                 "left_front_m": float(context.get("left_front_m", 80.0)),
@@ -1634,8 +2461,17 @@ class DreamerGuard:
                 "right_oncoming_m": float(context.get("right_oncoming_m", 80.0)),
                 "left_oncoming_ttc_s": float(context.get("left_oncoming_ttc_s", 99.0)),
                 "right_oncoming_ttc_s": float(context.get("right_oncoming_ttc_s", 99.0)),
+                "current_oncoming_distance_m": float(context.get("current_oncoming_distance_m", 80.0)),
+                "current_oncoming_closing_speed_mps": float(context.get("current_oncoming_closing_speed_mps", 0.0)),
+                "current_oncoming_ttc_s": float(context.get("current_oncoming_ttc_s", 99.0)),
+                "current_oncoming_actor_id": int(context.get("current_oncoming_actor_id", -1)),
                 "left_lane_available": bool(float(context.get("left_lane_available", 1.0)) >= 0.5),
                 "right_lane_available": bool(float(context.get("right_lane_available", 1.0)) >= 0.5),
+                "ego_road_id": int(context.get("ego_road_id", 0)),
+                "ego_lane_id": int(context.get("ego_lane_id", 0)),
+                "ego_lane_width_m": float(context.get("ego_lane_width_m", 3.5)),
+                "ego_lane_center_offset_m": float(context.get("ego_lane_center_offset_m", 0.0)),
+                "nearby_vehicles": list(context.get("nearby_vehicles", [])),
                 "traffic_light": context.get("traffic_light", "none"),
                 "collision_shield_active": False,
                 "collision_shield_reason": "",
@@ -1652,10 +2488,15 @@ class DreamerGuard:
                 "rl_action_space": self.config.rl_action_space,
                 "rl_action_semantics": self.policy_action_semantics,
                 "rl_policy_input_semantics": self.policy_input_semantics,
+                "rl_actor_intervention_strength": actor_intervention,
                 "rl_intervention_strength": intervention,
                 "rl_control_delta": control_delta,
                 "simlingo_weight": 1.0 - intervention,
                 "dreamer_weight": intervention,
+                "rssm_score_advantage": score_advantage if self.is_temporal_world_model else 0.0,
+                "rssm_authority_confidence": authority_confidence if self.is_temporal_world_model else 1.0,
+                "rssm_planner_candidates": len(scored) if self.is_temporal_world_model else 1,
+                "rssm_authority_temperature": self.rssm_authority_temperature if self.is_temporal_world_model else 0.0,
                 "no_guard": True,
             }
             should_log = applied or (
@@ -1668,16 +2509,22 @@ class DreamerGuard:
                 print(
                     "SIMLINGO_DREAMER_RL_NOGUARD "
                     f"step={getattr(agent, 'step', -1)} variant={self.config.variant} "
-                    f"candidate=policy applied={int(applied)} "
+                    f"candidate={info['candidate_index']} applied={int(applied)} "
                     f"risk={info['base_risk']:.3f}->{info['chosen_risk']:.3f} "
                     f"progress={info['base_progress']:.4f}->{info['chosen_progress']:.4f} "
                     f"kind={info['chosen_kind']} blocked={info['blocked_ticks']} "
+                    f"planner={info['rssm_planner_candidates']} "
                     f"mix=simlingo:{info['simlingo_weight']:.2f}/dreamer:{info['dreamer_weight']:.2f} "
+                    f"margin={info['rssm_score_advantage']:.4f} "
+                    f"utility_residual={info['chosen_utility_residual']:+.4f} "
+                    f"confidence={info['rssm_authority_confidence']:.3f} "
+                    f"actor_gate={info['rl_actor_intervention_strength']:.3f} "
                     f"front={info['front_vehicle_m']:.1f} "
                     f"Lf/R={info['left_front_m']:.1f}/{info['left_rear_m']:.1f} "
                     f"Rf/R={info['right_front_m']:.1f}/{info['right_rear_m']:.1f} "
                     f"onL={info['left_oncoming_m']:.1f}/{info['left_oncoming_ttc_s']:.1f} "
                     f"onR={info['right_oncoming_m']:.1f}/{info['right_oncoming_ttc_s']:.1f} "
+                    f"onC={info['current_oncoming_distance_m']:.1f}/{info['current_oncoming_ttc_s']:.1f} "
                     f"S {float(base_action[0]):+.2f}->{float(chosen_action[0]):+.2f} "
                     f"T {float(base_action[1]):.2f}->{float(chosen_action[1]):.2f} "
                     f"B {float(base_action[2]):.2f}->{float(chosen_action[2]):.2f}",
@@ -1737,6 +2584,8 @@ class DreamerGuard:
             "recovery_finish_active_ticks": int(self.recovery_finish_active_ticks),
             "recovery_side": int(self.recovery_side),
             "front_vehicle_m": float(context.get("front_vehicle_m", 80.0)),
+            "front_vehicle_id": int(context.get("front_vehicle_id", -1)),
+            "front_vehicle_clearance_m": float(context.get("front_vehicle_clearance_m", 80.0)),
             "nearest_walker_m": float(context.get("nearest_walker_m", 80.0)),
             "nearest_bike_m": float(context.get("nearest_bike_m", 80.0)),
             "left_front_m": float(context.get("left_front_m", 80.0)),
@@ -1751,8 +2600,17 @@ class DreamerGuard:
             "right_oncoming_m": float(context.get("right_oncoming_m", 80.0)),
             "left_oncoming_ttc_s": float(context.get("left_oncoming_ttc_s", 99.0)),
             "right_oncoming_ttc_s": float(context.get("right_oncoming_ttc_s", 99.0)),
+            "current_oncoming_distance_m": float(context.get("current_oncoming_distance_m", 80.0)),
+            "current_oncoming_closing_speed_mps": float(context.get("current_oncoming_closing_speed_mps", 0.0)),
+            "current_oncoming_ttc_s": float(context.get("current_oncoming_ttc_s", 99.0)),
+            "current_oncoming_actor_id": int(context.get("current_oncoming_actor_id", -1)),
             "left_lane_available": bool(float(context.get("left_lane_available", 1.0)) >= 0.5),
             "right_lane_available": bool(float(context.get("right_lane_available", 1.0)) >= 0.5),
+            "ego_road_id": int(context.get("ego_road_id", 0)),
+            "ego_lane_id": int(context.get("ego_lane_id", 0)),
+            "ego_lane_width_m": float(context.get("ego_lane_width_m", 3.5)),
+            "ego_lane_center_offset_m": float(context.get("ego_lane_center_offset_m", 0.0)),
+            "nearby_vehicles": list(context.get("nearby_vehicles", [])),
             "traffic_light": context.get("traffic_light", "none"),
             "collision_shield_active": bool(chosen.get("shield_active", False)),
             "collision_shield_reason": str(chosen.get("shield_reason", "")),
@@ -1785,6 +2643,7 @@ class DreamerGuard:
                 f"ttcL={info['left_ttc_s']:.1f} ttcR={info['right_ttc_s']:.1f} "
                 f"onL={info['left_oncoming_m']:.1f}/{info['left_oncoming_ttc_s']:.1f} "
                 f"onR={info['right_oncoming_m']:.1f}/{info['right_oncoming_ttc_s']:.1f} "
+                f"onC={info['current_oncoming_distance_m']:.1f}/{info['current_oncoming_ttc_s']:.1f} "
                 f"safe={info['safe_recovery_sides']} gap={info['gap_recovery_sides']} "
                 f"tl={info['traffic_light']} "
                 f"shield={int(info['collision_shield_active'])} {info['collision_shield_reason']}",
@@ -1839,6 +2698,8 @@ class DreamerGuard:
                 "recovery_finish_active_ticks": int(info.get("recovery_finish_active_ticks", 0)),
                 "recovery_side": int(info.get("recovery_side", 0)),
                 "front_vehicle_m": float(info.get("front_vehicle_m", 80.0)),
+                "front_vehicle_id": int(info.get("front_vehicle_id", -1)),
+                "front_vehicle_clearance_m": float(info.get("front_vehicle_clearance_m", 80.0)),
                 "nearest_walker_m": float(info.get("nearest_walker_m", 80.0)),
                 "nearest_bike_m": float(info.get("nearest_bike_m", 80.0)),
                 "left_front_m": float(info.get("left_front_m", 80.0)),
@@ -1853,8 +2714,17 @@ class DreamerGuard:
                 "right_oncoming_m": float(info.get("right_oncoming_m", 80.0)),
                 "left_oncoming_ttc_s": float(info.get("left_oncoming_ttc_s", 99.0)),
                 "right_oncoming_ttc_s": float(info.get("right_oncoming_ttc_s", 99.0)),
+                "current_oncoming_distance_m": float(info.get("current_oncoming_distance_m", 80.0)),
+                "current_oncoming_closing_speed_mps": float(info.get("current_oncoming_closing_speed_mps", 0.0)),
+                "current_oncoming_ttc_s": float(info.get("current_oncoming_ttc_s", 99.0)),
+                "current_oncoming_actor_id": int(info.get("current_oncoming_actor_id", -1)),
                 "left_lane_available": bool(info.get("left_lane_available", True)),
                 "right_lane_available": bool(info.get("right_lane_available", True)),
+                "ego_road_id": int(info.get("ego_road_id", 0)),
+                "ego_lane_id": int(info.get("ego_lane_id", 0)),
+                "ego_lane_width_m": float(info.get("ego_lane_width_m", 3.5)),
+                "ego_lane_center_offset_m": float(info.get("ego_lane_center_offset_m", 0.0)),
+                "nearby_vehicles": list(info.get("nearby_vehicles", [])),
                 "traffic_light": info.get("traffic_light", "none"),
                 "collision_shield_active": bool(info.get("collision_shield_active", False)),
                 "collision_shield_reason": str(info.get("collision_shield_reason", "")),
@@ -1869,10 +2739,14 @@ class DreamerGuard:
                 "rl_deterministic": bool(info.get("rl_deterministic", False)),
                 "rl_action_space": str(info.get("rl_action_space", "")),
                 "rl_action_semantics": str(info.get("rl_action_semantics", "")),
+                "rl_actor_intervention_strength": float(info.get("rl_actor_intervention_strength", 0.0)),
                 "rl_intervention_strength": float(info.get("rl_intervention_strength", 0.0)),
                 "rl_control_delta": float(info.get("rl_control_delta", 0.0)),
                 "simlingo_weight": float(info.get("simlingo_weight", 1.0)),
                 "dreamer_weight": float(info.get("dreamer_weight", 0.0)),
+                "rssm_score_advantage": float(info.get("rssm_score_advantage", 0.0)),
+                "rssm_authority_confidence": float(info.get("rssm_authority_confidence", 0.0)),
+                "rssm_authority_temperature": float(info.get("rssm_authority_temperature", 0.0)),
                 "no_guard": bool(info.get("no_guard", False)),
                 "base_action": {
                     "steer": float(base_action[0]),

@@ -18,6 +18,7 @@ patterns=(
   "scripts/carla_ego_viewer.py"
   "scripts/carla_sumo_mirror.py"
   "scripts/vlm_cot_sidecar.py"
+  "scripts/cardreamer_shadow_sidecar.py"
   "scripts/run_twinsentinel_attack_console.sh"
   "experiments/TwinSentinel_Project/node_dashboard/server.js"
   "leaderboard_evaluator.py"

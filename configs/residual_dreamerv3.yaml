@@ -1,0 +1,94 @@
+schema_version: residual_dreamerv3_v2
+
+data:
+  observation_dim: 32
+  action_dim: 3
+  sequence_length: 32
+  split_seed: 20260830
+  train_ratio: 0.50
+  validation_ratio: 0.25
+  test_ratio: 0.25
+  minimum_train_seeds: 3
+  minimum_validation_seeds: 2
+  minimum_test_seeds: 2
+  require_native_simlingo: true
+  require_bench2drive_ground_truth: true
+  maximum_step_progress_m: 5.0
+  event_window_weight: 32.0
+  danger_window_weight: 4.0
+  danger_risk_threshold: 0.65
+
+model:
+  observation_dim: 32
+  action_dim: 3
+  encoder_dim: 192
+  hidden_dim: 384
+  deterministic_size: 256
+  stochastic_size: 16
+  categorical_classes: 16
+  unimix: 0.01
+  free_nats: 1.0
+  dynamics_kl_scale: 0.5
+  representation_kl_scale: 0.1
+  reward_bins: 255
+  reward_low: -20.0
+  reward_high: 20.0
+  value_bins: 255
+  value_low: -20.0
+  value_high: 20.0
+
+loss:
+  observation: 1.0
+  reward: 1.0
+  continuation: 1.0
+  risk: 2.0
+  collision: 4.0
+  offroad: 3.0
+  prior_prediction: 1.0
+  collision_positive_weight: 8.0
+  offroad_positive_weight: 6.0
+
+reward:
+  progress_scale: 1.0
+  safe_scale: 0.25
+  collision_penalty: 25.0
+  offroad_penalty: 12.0
+  control_change_penalty: 0.08
+  completion_bonus: 5.0
+  intervention_penalty: 0.03
+  residual_change_penalty: 0.04
+
+actor:
+  hidden_dim: 384
+  imagination_horizon: 15
+  discount: 0.997
+  lambda_return: 0.95
+  entropy_scale: 0.0003
+  slow_critic_fraction: 0.02
+  slow_critic_regularization: 1.0
+  maximum_steer_residual: 0.30
+  maximum_longitudinal_residual: 0.60
+  initial_authority: 0.02
+  minimum_std: 0.05
+  maximum_std: 1.0
+
+training:
+  batch_size: 32
+  world_model_epochs: 40
+  actor_epochs: 40
+  world_model_learning_rate: 0.0001
+  actor_learning_rate: 0.00003
+  critic_learning_rate: 0.00003
+  weight_decay: 0.000001
+  gradient_clip: 100.0
+  maximum_windows: 0
+  device: cuda
+
+gate:
+  horizons: [1, 5, 10, 20]
+  minimum_observation_improvement: 0.02
+  minimum_reward_improvement: 0.0
+  minimum_risk_improvement: 0.0
+  maximum_action_collapse_fraction: 0.10
+  minimum_action_transition_spread: 0.001
+  require_all_finite: true

@@ -3,6 +3,7 @@ import argparse
 import json
 import math
 import pathlib
+import signal
 import time
 from collections import deque
 
@@ -10,6 +11,14 @@ import carla
 import cv2
 import numpy as np
 import pygame
+
+
+STOP_REQUESTED = False
+
+
+def request_stop(_signum, _frame):
+    global STOP_REQUESTED
+    STOP_REQUESTED = True
 
 
 def find_ego(world):
@@ -100,6 +109,20 @@ def draw_overlay(screen, font, width, height, message, alpha=170):
 
 
 def read_dreamer_status(path):
+    if not path:
+        return None
+    status_path = pathlib.Path(path)
+    if not status_path.exists():
+        return None
+    try:
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+        payload["stale"] = time.time() - float(payload.get("timestamp", 0.0)) > 3.0
+        return payload
+    except Exception:
+        return None
+
+
+def read_cardreamer_status(path):
     if not path:
         return None
     status_path = pathlib.Path(path)
@@ -321,6 +344,119 @@ def draw_dreamer_overlay(screen, font, width, status):
     screen.blit(surface, (x, y))
 
 
+def draw_cardreamer_overlay(
+    screen, font, width, height, status, control_status=None, dreamer_status=None
+):
+    if not status:
+        return
+
+    panel_w = min(560, max(360, width - 410))
+    residual_mode = str(status.get("mode", "shadow")) == "residual"
+    panel_h = 291 if residual_mode else 164
+    x = width - panel_w - 16
+    y = 198 if dreamer_status else 16
+    y = min(y, max(16, height - panel_h - 54))
+    surface = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+    surface.fill((8, 13, 22, 218))
+
+    state = str(status.get("state", "waiting"))
+    stale = bool(status.get("stale"))
+    unsafe = bool(status.get("unsafe"))
+    applied = bool((control_status or {}).get("applied"))
+    label = str(status.get("coherence_label", "waiting"))
+    if stale:
+        color = (148, 163, 184)
+        badge = "STALE"
+    elif residual_mode and str((control_status or {}).get("reason", "")).startswith("traffic_gate"):
+        color = (251, 191, 36)
+        badge = "TRAFFIC GATE"
+    elif residual_mode and unsafe and applied:
+        color = (248, 113, 113)
+        badge = "UNSAFE ACCEPTED"
+    elif unsafe:
+        color = (248, 113, 113)
+        badge = "UNSAFE PROPOSAL"
+    elif label == "coherent_overtake_proposal":
+        color = (126, 242, 162)
+        badge = "COHERENT OVERTAKE"
+    elif label.startswith("missed_"):
+        color = (251, 191, 36)
+        badge = "MISSED OPPORTUNITY"
+    elif state != "observing":
+        color = (148, 163, 184)
+        badge = state.upper().replace("_", " ")
+    else:
+        color = (110, 231, 249)
+        badge = "OBSERVING"
+
+    pygame.draw.rect(surface, color, pygame.Rect(0, 0, 6, panel_h))
+    runtime_label = "RSSM MIRROR | RESIDUAL" if residual_mode else "SHADOW | READ ONLY"
+    title = font.render(f"CarDreamer {runtime_label} | {badge}", True, color)
+    surface.blit(title, (18, 10))
+
+    action = status.get("proposed_control", {})
+    lines = [
+        (
+            "Official overtake.ckpt | privileged BEV | traffic gate ON"
+            if residual_mode
+            else "Official overtake.ckpt | privileged BEV | control authority: NONE"
+        ),
+        (
+            f"proposal {status.get('maneuver', 'waiting')}  action {status.get('action_index', '-')}  "
+            f"S {float(action.get('steer', 0.0)):+.2f}  "
+            f"T {float(action.get('throttle', 0.0)):.2f}  B {float(action.get('brake', 0.0)):.2f}"
+        ),
+        (
+            f"front {float(status.get('front_vehicle_m', 80.0)):.1f}m  "
+            f"left clear {float(status.get('left_clear_m', 80.0)):.1f}m  "
+            f"rear {float(status.get('left_rear_m', 80.0)):.1f}m / "
+            f"TTC {float(status.get('left_rear_ttc_s', 99.0)):.1f}s"
+        ),
+        (
+            f"oncoming {float(status.get('left_oncoming_m', 80.0)):.1f}m / "
+            f"TTC {float(status.get('left_oncoming_ttc_s', 99.0)):.1f}s"
+        ),
+        (
+            f"blocked {int(bool(status.get('blocked', False)))}  "
+            f"safe gap {int(bool(status.get('safe_overtake_opportunity', False)))}  "
+            f"assessment {label}"
+        ),
+    ]
+    if residual_mode:
+        control_status = control_status or {}
+        base = control_status.get("base_control", {})
+        final = control_status.get("applied_control", {})
+        lines.insert(
+            2,
+            (
+                f"SimLingo -> applied  S {float(base.get('steer', 0.0)):+.2f}->"
+                f"{float(final.get('steer', 0.0)):+.2f}  T {float(base.get('throttle', 0.0)):.2f}->"
+                f"{float(final.get('throttle', 0.0)):.2f}  B {float(base.get('brake', 0.0)):.2f}->"
+                f"{float(final.get('brake', 0.0)):.2f}"
+            ),
+        )
+        lines.append(
+            f"applied {int(applied)}  alpha {float(control_status.get('alpha', 0.0)):.2f}  "
+            f"reason {str(control_status.get('reason', 'waiting'))[:36]}  EXPERIMENTAL"
+        )
+        lines.append(
+            f"longitudinal {control_status.get('longitudinal_mode', 'waiting')}  "
+            f"engaged {int(bool(control_status.get('engagement_active')))}  "
+            f"direction {control_status.get('engagement_direction') or '-'}  "
+            f"age {int(control_status.get('engagement_age_decisions', 0))}"
+        )
+        gate = control_status.get("traffic_gate", {})
+        lines.append(
+            f"traffic gate {('OPEN' if gate.get('open') else 'CLOSED')}  "
+            f"phase {gate.get('phase', '-')}  "
+            f"reason {control_status.get('traffic_gate_block_reason') or ','.join(gate.get('reasons', [])) or '-'}"
+        )
+    for index, line in enumerate(lines):
+        rendered = font.render(line, True, (235, 241, 249))
+        surface.blit(rendered, (18, 40 + index * 27))
+    screen.blit(surface, (x, y))
+
+
 def draw_held_frame(screen, font, width, height, frame, message):
     blit_frame(screen, frame)
     draw_overlay(screen, font, width, height, message, alpha=190)
@@ -458,7 +594,7 @@ def draw_traffic_light_overlay(screen, font, world, sensor, width, height, fov, 
 def connect_client(host, port, timeout):
     deadline = time.time() + timeout
     last_error = None
-    while time.time() < deadline:
+    while not STOP_REQUESTED and time.time() < deadline:
         try:
             client = carla.Client(host, port)
             client.set_timeout(4.0)
@@ -467,6 +603,8 @@ def connect_client(host, port, timeout):
         except Exception as exc:
             last_error = exc
             time.sleep(1.0)
+    if STOP_REQUESTED:
+        return None
     raise RuntimeError(f"Could not connect to CARLA on {host}:{port}: {last_error}")
 
 
@@ -528,6 +666,9 @@ def spawn_camera(world, ego, args, frame_queue, stats):
 
 
 def main():
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=2000)
@@ -549,6 +690,8 @@ def main():
     parser.add_argument("--record-path")
     parser.add_argument("--record-fps", type=float, default=30.0)
     parser.add_argument("--dreamer-status-path", default="")
+    parser.add_argument("--cardreamer-status-path", default="")
+    parser.add_argument("--cardreamer-control-status-path", default="")
     parser.add_argument("--cot-status-path", default="")
     parser.add_argument("--cot-frame-path", default="")
     parser.add_argument("--cot-frame-interval", type=float, default=2.0)
@@ -577,6 +720,9 @@ def main():
 
     draw_status(screen, font, args.width, args.height, f"Connecting to CARLA on {args.host}:{args.port}...")
     client = connect_client(args.host, args.port, args.timeout)
+    if client is None:
+        pygame.quit()
+        return
     frame_queue = deque(maxlen=1)
     camera_stats = {"last_raw_mean": 0.0, "dropped_dark_frames": 0}
     last_frame = None
@@ -587,13 +733,15 @@ def main():
     start = time.time()
 
     try:
-        while time.time() - start < args.timeout and ego is None:
+        while not STOP_REQUESTED and time.time() - start < args.timeout and ego is None:
             world = client.get_world()
             ego = find_ego(world)
             if ego is None:
                 draw_status(screen, font, args.width, args.height, "Waiting for SimLingo ego vehicle...")
                 time.sleep(1.0)
 
+        if STOP_REQUESTED:
+            return
         if ego is None:
             raise RuntimeError("No ego vehicle found. Start SimLingo first.")
 
@@ -603,7 +751,7 @@ def main():
 
         clock = pygame.time.Clock()
         running = True
-        while running:
+        while running and not STOP_REQUESTED:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -692,6 +840,15 @@ def main():
                 dreamer_status,
             )
             draw_dreamer_overlay(screen, font, args.width, dreamer_status)
+            draw_cardreamer_overlay(
+                screen,
+                font,
+                args.width,
+                args.height,
+                read_cardreamer_status(args.cardreamer_status_path),
+                read_cardreamer_status(args.cardreamer_control_status_path),
+                dreamer_status,
+            )
             if args.traffic_light_overlay:
                 draw_traffic_light_overlay(
                     screen,

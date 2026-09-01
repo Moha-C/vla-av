@@ -10,8 +10,18 @@ __pycache__/
 .cache/
 .conda_node/
 .venv/
+.venv-streamlit/
 venv/
 env/
+.codex
+.codex/
+.agents/
+.streamlit/secrets.toml
+.streamlit/credentials.toml
+
+# A generic local environment file from an older experiment. The supported
+# reproducible environment is environment.simlingo.yml.
+environment.yml
 
 # Local secrets and credentials. Never commit personal access tokens.
 .env
@@ -61,6 +71,17 @@ pretrained/
 !external/simlingo/checkpoints/dreamer_ppo_rl_noguard/latest_rl_model.pt
 !external/simlingo/checkpoints/dreamer_sdbs_rl_noguard/latest_rl_model.pt
 
+# Keep only the promoted report-aligned RSSM artifact at the repository root.
+# Candidates, failed gates, optimizer states, and local training snapshots stay
+# on the workstation and can be regenerated from the committed pipeline.
+checkpoints/*
+!checkpoints/report_aligned_dreamer/
+checkpoints/report_aligned_dreamer/*
+!checkpoints/report_aligned_dreamer/production/
+checkpoints/report_aligned_dreamer/production/*
+!checkpoints/report_aligned_dreamer/production/report_dreamer.pt
+!checkpoints/report_aligned_dreamer/production/report_dreamer.manifest.json
+
 # Never commit videos, datasets, run archives, or raw notebooks outputs by default.
 *.mp4
 *.webm
@@ -78,6 +99,45 @@ pretrained/
 *.parquet
 *.jsonl
 
+# Runtime and training datasets are local artifacts, never source code. Keep a
+# small inventory so a fresh clone knows how to regenerate them.
+data/*
+!data/README.md
+
+# DeepAccident is downloaded separately (9 GB mini / 313 GB full). Keep only
+# the reproducible preparation and training code in Git.
+data/deepaccident/raw/
+data/deepaccident/extracted/
+data/deepaccident/processed/
+checkpoints/deepaccident/
+
+# Historical side experiments are preserved locally but are not dependencies
+# of the active SimLingo/Dreamer/CARLA/SUMO pipeline.
+cloud_b200/
+vm_full_sft_patch/
+external/Simple-carla-WAM/
+external/alpamayo1.5/
+external/alpamayo_official/
+external/maram_dreamer/
+experiments/maram_dreamer_carla/
+docs/VLA_AV_RAPPORT_STAGE_DRAFT*/
+docs/rapport_stage/
+start.sh
+
+# Local training evidence and candidate artifacts. The promoted report RSSM
+# above and the already tracked compact runtime checkpoints are sufficient for
+# a fresh runtime clone.
+external/simlingo/checkpoints/dreamer_ppo_complement/
+external/simlingo/checkpoints/dreamer_ppo_rl_noguard/checkpoint_roles.json
+external/simlingo/checkpoints/dreamer_ppo_rl_noguard/offline_warmstarts/
+external/simlingo/checkpoints/dreamer_ppo_rl_noguard/protected_snapshots/
+external/simlingo/checkpoints/dreamer_ppo_rssm_v2/
+external/simlingo/checkpoints/dreamer_ppo_rssm_v3/
+external/simlingo/checkpoints/dreamer_ppo_rssm_v4/
+external/simlingo/checkpoints/dreamer_ppo_rssm_v4_soft_trial/
+external/simlingo/checkpoints/dreamer_sdbs_complement/
+external/simlingo/checkpoints/dreamer_sdbs_rl_noguard/offline_warmstarts/
+
 # TwinSentinel vendored code is useful, but its cloned git history, map packs,
 # and experiment runs are too large for the main repository.
 experiments/TwinSentinel_Project/.git/
@@ -87,4 +147,5 @@ experiments/TwinSentinel_Project/maps/
 # Nested upstream git histories should be handled as submodules or flattened
 # deliberately before the first root commit.
 external/*/.git/
+external/*/.git.upstream/
 experiments/*/.git/

@@ -113,6 +113,7 @@ export SCENARIO_RUNNER_ROOT="$SIMLINGO_ROOT/Bench2Drive/scenario_runner"
 export LEADERBOARD_ROOT="$SIMLINGO_ROOT/Bench2Drive/leaderboard"
 export SAVE_PATH="$OUT_DIR/viz/"
 export ROUTES="$ROUTE_XML"
+export SIMLINGO_RESULT_JSON="$RESULT_JSON"
 export SIMLINGO_CARLA_LOG="$CARLA_LOG"
 # Use carla==0.9.15 from the simlingo conda env, plus CARLA's PythonAPI/carla
 # directory only for the "agents" helper package. Do not add the py3.7 egg:

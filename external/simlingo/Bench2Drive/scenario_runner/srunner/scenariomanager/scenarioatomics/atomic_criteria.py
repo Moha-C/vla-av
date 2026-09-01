@@ -15,7 +15,10 @@ actors or environmental parameters. Hence, a termination is not required.
 The atomic criteria are implemented with py_trees.
 """
 
+import json
 import math
+import os
+import time
 import numpy as np
 import py_trees
 import shapely.geometry
@@ -26,6 +29,59 @@ from agents.tools.misc import get_speed
 from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 from srunner.scenariomanager.timer import GameTime
 from srunner.scenariomanager.traffic_events import TrafficEvent, TrafficEventType
+
+
+_ONLINE_RL_COLLISION_EVENTS_WRITTEN = set()
+
+
+def _write_online_rl_collision_event(event, actor_location, collision_kind, criterion_name):
+    """Append the first-class impact marker consumed by the online RL updater."""
+    path = os.environ.get("SIMLINGO_COLLISION_EVENT_PATH", "").strip()
+    if not path:
+        return
+    frame = int(GameTime.get_frame())
+    actor_id = int(getattr(event.other_actor, "id", 0))
+    dedupe_key = (path, frame, actor_id)
+    if dedupe_key in _ONLINE_RL_COLLISION_EVENTS_WRITTEN:
+        return
+    _ONLINE_RL_COLLISION_EVENTS_WRITTEN.add(dedupe_key)
+    try:
+        impulse = event.normal_impulse
+        impulse_magnitude = math.sqrt(
+            float(impulse.x) ** 2 + float(impulse.y) ** 2 + float(impulse.z) ** 2
+        )
+    except Exception:
+        impulse_magnitude = 0.0
+    payload = {
+        "event": "collision",
+        "source": "bench2drive_collision_sensor",
+        "wall_time": time.time(),
+        "game_time": float(GameTime.get_time()),
+        "frame": frame,
+        "collision_kind": str(collision_kind),
+        "criterion": str(criterion_name),
+        "other_actor_id": actor_id,
+        "other_actor_type": str(getattr(event.other_actor, "type_id", "unknown")),
+        "impulse_magnitude": float(impulse_magnitude),
+        "ego_location": {
+            "x": float(actor_location.x),
+            "y": float(actor_location.y),
+            "z": float(actor_location.z),
+        },
+    }
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        line = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+        descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o664)
+        try:
+            os.write(descriptor, line)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        pass
 
 
 class Criterion(py_trees.behaviour.Behaviour):
@@ -395,12 +451,22 @@ class CollisionTest(Criterion):
         if ('static' in event.other_actor.type_id or 'traffic' in event.other_actor.type_id) \
                 and 'sidewalk' not in event.other_actor.type_id:
             actor_type = TrafficEventType.COLLISION_STATIC
+            collision_kind = "static"
         elif 'vehicle' in event.other_actor.type_id:
             actor_type = TrafficEventType.COLLISION_VEHICLE
+            collision_kind = "vehicle"
         elif 'walker' in event.other_actor.type_id:
             actor_type = TrafficEventType.COLLISION_PEDESTRIAN
+            collision_kind = "pedestrian"
         else:
             return
+
+        _write_online_rl_collision_event(
+            event,
+            actor_location,
+            collision_kind,
+            self.name,
+        )
 
         collision_event = TrafficEvent(event_type=actor_type, frame=GameTime.get_frame())
         collision_event.set_dict({'other_actor': event.other_actor, 'location': actor_location})

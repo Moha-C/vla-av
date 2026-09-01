@@ -180,16 +180,90 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         except ValueError:
             self.profile_every = 40
         self.draw_waypoints = os.environ.get("SIMLINGO_DRAW_WAYPOINTS", "1").lower() not in ("0", "false", "no")
+        report_dreamer_mode = os.environ.get(
+            "SIMLINGO_REPORT_DREAMER_MODE", "off"
+        ).lower()
+        report_dreamer_requested = report_dreamer_mode not in (
+            "",
+            "0",
+            "false",
+            "no",
+            "off",
+            "none",
+        )
         self.dreamer_guard = None
         self.last_dreamer_guard_info = {}
         dreamer_runtime = os.environ.get("SIMLINGO_DREAMER_RUNTIME", "").lower()
         dreamer_guard_enabled = os.environ.get("SIMLINGO_DREAMER_GUARD", "0").lower() not in ("", "0", "false", "no", "off")
-        if dreamer_guard_enabled or dreamer_runtime == "rl_noguard":
+        if not report_dreamer_requested and (
+            dreamer_guard_enabled or dreamer_runtime == "rl_noguard"
+        ):
             try:
                 from team_code.dreamer_guard import DreamerGuard
                 self.dreamer_guard = DreamerGuard.from_env()
             except Exception as exc:
                 print(f"SIMLINGO_DREAMER runtime disabled: {exc}", flush=True)
+        self.cardreamer_residual = None
+        self.last_cardreamer_residual_info = {}
+        if (
+            not report_dreamer_requested
+            and os.environ.get("SIMLINGO_CARDREAMER_MODE", "off").lower()
+            == "residual"
+        ):
+            try:
+                from team_code.cardreamer_residual import CarDreamerResidualAdapter
+                self.cardreamer_residual = CarDreamerResidualAdapter.from_env()
+                print(
+                    "SIMLINGO_CARDREAMER_RESIDUAL: official CarDreamer proposal "
+                    "blended with native SimLingo; mirror coordinates; "
+                    "task-scoped authority with explicit traffic gate.",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"SIMLINGO_CARDREAMER residual disabled: {exc}", flush=True)
+        self.report_dreamer = None
+        self.last_report_dreamer_info = {}
+        if report_dreamer_requested:
+            try:
+                from team_code.report_dreamer_adapter import ReportDreamerAdapter
+
+                self.report_dreamer = ReportDreamerAdapter.from_env()
+                print(
+                    "SIMLINGO_REPORT_DREAMER enabled: independent report-aligned "
+                    "RSSM complement; native candidate is index 0. "
+                    f"ablation={self.report_dreamer.ablation} "
+                    f"shadow={int(self.report_dreamer.shadow)} "
+                    f"checkpoint={self.report_dreamer.checkpoint} "
+                    f"trace={self.report_dreamer.trace_path or '-'}",
+                    flush=True,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "SIMLINGO_REPORT_DREAMER was explicitly requested but "
+                    f"could not be initialized: {exc}"
+                ) from exc
+        self.report_native_collector = None
+        try:
+            from team_code.report_dreamer_adapter import ReportNativeTraceCollector
+
+            self.report_native_collector = ReportNativeTraceCollector.from_env()
+        except Exception as exc:
+            if os.environ.get("SIMLINGO_REPORT_NATIVE_TRACE", "").strip():
+                raise RuntimeError(
+                    "native SimLingo report collection was requested but "
+                    f"could not be initialized: {exc}"
+                ) from exc
+        if self.report_native_collector is not None:
+            if self.report_dreamer is not None or self.dreamer_guard is not None or self.cardreamer_residual is not None:
+                raise RuntimeError(
+                    "Phase-1 native collection cannot run with any Dreamer/guard adapter"
+                )
+            print(
+                "SIMLINGO_REPORT_NATIVE_COLLECT enabled: controls remain exactly "
+                "native SimLingo; trace="
+                f"{self.report_native_collector.trace_path}",
+                flush=True,
+            )
         self.last_control_debug = {}
         self.image_transform = build_transform(input_size=448)
         self.conv_module = None
@@ -884,8 +958,29 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         current_speed = float(gt_velocity[0].detach().cpu())
 
         control = carla.VehicleControl(steer=float(steer), throttle=float(throttle), brake=float(brake))
-        if self.step >= self.config.inital_frames_delay and self.dreamer_guard is not None:
+        if (
+            self.step >= self.config.inital_frames_delay
+            and self.report_native_collector is not None
+        ):
+            self.report_native_collector.record(self, tick_data, control)
+        if self.step >= self.config.inital_frames_delay and self.report_dreamer is not None:
+            control, self.last_report_dreamer_info = self.report_dreamer.maybe_apply(
+                self, tick_data, control
+            )
+            steer = control.steer
+            throttle = control.throttle
+            brake = control.brake
+        elif self.step >= self.config.inital_frames_delay and self.dreamer_guard is not None:
             control, self.last_dreamer_guard_info = self.dreamer_guard.maybe_override(self, tick_data, control)
+            steer = control.steer
+            throttle = control.throttle
+            brake = control.brake
+        if (
+            self.step >= self.config.inital_frames_delay
+            and self.report_dreamer is None
+            and self.cardreamer_residual is not None
+        ):
+            control, self.last_cardreamer_residual_info = self.cardreamer_residual.maybe_apply(control)
             steer = control.steer
             throttle = control.throttle
             brake = control.brake
@@ -928,6 +1023,53 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
                     f"{float(dreamer_dbg.get('chosen_risk', float('nan'))):.3f} "
                     f"progress={float(dreamer_dbg.get('base_progress', float('nan'))):.4f}->"
                     f"{float(dreamer_dbg.get('chosen_progress', float('nan'))):.4f}",
+                    flush=True,
+                )
+            cardreamer_dbg = getattr(self, "last_cardreamer_residual_info", {})
+            if cardreamer_dbg:
+                cardreamer_base = cardreamer_dbg.get("base_control", {})
+                cardreamer_applied = cardreamer_dbg.get("applied_control", {})
+                print(
+                    "SIMLINGO_CARDREAMER_PROFILE "
+                    f"step={self.step} applied={int(bool(cardreamer_dbg.get('applied')))} "
+                    f"reason={cardreamer_dbg.get('reason')} "
+                    f"unsafe_accepted={int(bool(cardreamer_dbg.get('unsafe_proposal_accepted')))} "
+                    f"kind={cardreamer_dbg.get('proposal_maneuver')} "
+                    f"candidate={cardreamer_dbg.get('proposal_action_index')} "
+                    f"engaged={int(bool(cardreamer_dbg.get('engagement_active')))} "
+                    f"engage_age={cardreamer_dbg.get('engagement_age_decisions', 0)} "
+                    f"long_mode={cardreamer_dbg.get('longitudinal_mode')} "
+                    f"gate={int(bool(cardreamer_dbg.get('traffic_gate', {}).get('open')))} "
+                    f"gate_reason={cardreamer_dbg.get('traffic_gate_block_reason', '-')} "
+                    f"ttcL={cardreamer_dbg.get('left_oncoming_ttc_s')} "
+                    f"ttcR={cardreamer_dbg.get('right_oncoming_ttc_s')} "
+                    f"rearTtcL={cardreamer_dbg.get('left_rear_ttc_s')} "
+                    f"rearTtcR={cardreamer_dbg.get('right_rear_ttc_s')} "
+                    f"steer={float(cardreamer_base.get('steer', 0.0)):+.3f}->"
+                    f"{float(cardreamer_applied.get('steer', 0.0)):+.3f} "
+                    f"throttle={float(cardreamer_base.get('throttle', 0.0)):.3f}->"
+                    f"{float(cardreamer_applied.get('throttle', 0.0)):.3f} "
+                    f"brake={float(cardreamer_base.get('brake', 0.0)):.3f}->"
+                    f"{float(cardreamer_applied.get('brake', 0.0)):.3f}",
+                    flush=True,
+                )
+            report_dbg = getattr(self, "last_report_dreamer_info", {})
+            if report_dbg:
+                print(
+                    "SIMLINGO_REPORT_DREAMER_PROFILE "
+                    f"step={self.step} ablation={report_dbg.get('ablation')} "
+                    f"shadow={int(bool(report_dbg.get('shadow')))} "
+                    f"candidate={report_dbg.get('selected_index')} "
+                    f"kind={report_dbg.get('selected_kind')} "
+                    f"alpha={float(report_dbg.get('alpha', 0.0)):.3f} "
+                    f"applied={int(bool(report_dbg.get('applied')))} "
+                    f"risk={float(report_dbg.get('native_predicted_risk', float('nan'))):.3f}->"
+                    f"{float(report_dbg.get('selected_predicted_risk', float('nan'))):.3f} "
+                    f"progress={float(report_dbg.get('native_predicted_progress', float('nan'))):.4f}->"
+                    f"{float(report_dbg.get('selected_predicted_progress', float('nan'))):.4f} "
+                    f"front={float(report_dbg.get('front_vehicle_m', 80.0)):.1f} "
+                    f"ttc={float(report_dbg.get('current_oncoming_ttc_s', 99.0)):.1f} "
+                    f"latency_ms={float(report_dbg.get('inference_latency_ms', float('nan'))):.2f}",
                     flush=True,
                 )
             if language_dbg:

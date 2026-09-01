@@ -1,95 +1,86 @@
-# Fresh Install Checklist
+# Fresh Install On Ubuntu 22.04
 
-This guide is for a new Ubuntu machine that wants to run the VLA-AV SimLingo
-pipeline from GitHub.
+This procedure reconstructs the active VLA-AV runtime on a new NVIDIA Ubuntu
+22.04 workstation without copying credentials, datasets, logs, or caches from
+the original machine.
 
-## What GitHub Contains
+## Hardware And Disk
 
-The repository contains the project source needed to run the current pipeline:
+- NVIDIA GPU and a working proprietary driver (`nvidia-smi`).
+- At least 32 GB RAM recommended.
+- At least 45 GB free before model caches and recordings.
+- Ports 2000/2001 for CARLA, 8765 for the local dashboard, and 8501 for the
+  optional read-only Streamlit presentation.
 
-- SimLingo/Bench2Drive integration.
-- Dashboard launchers and web UI.
-- Dreamer PPO and Dreamer SDBS runtime adapters.
-- CARLA/SUMO mirror scripts.
-- TwinSentinel attack-console integration.
-- SAFE-DREAM KPI dashboard code.
-- Small Dreamer runtime checkpoints.
-- Python dependency files and setup scripts.
-
-The repository intentionally does not contain:
-
-- CARLA binaries.
-- Large SimLingo Hugging Face model weights.
-- Large pretrained VLM caches.
-- Your local logs, videos, datasets, exports, VM backups, and failed experiments.
-- Personal tokens, keys, credentials, or local cache files.
-
-Those files are not recoverable from this repository and nobody gets access to
-your machine. A new user can only install public/upstream dependencies, download
-public model weights, or regenerate their own local artifacts.
-
-## Privacy And Secrets
-
-Do not commit personal Hugging Face, GitHub, OpenAI, WandB, SSH, or university
-tokens. If a model download ever requires authentication, the new user must log
-in with their own account/token:
-
-```bash
-hf auth login
-```
-
-The project should never require Mohammed's local tokens or private datasets to
-run the public/reproducible pipeline.
-
-## 1. Clone
+## 1. Clone Source And LFS Artifacts
 
 ```bash
 cd ~/Desktop
 git clone https://github.com/Moha-C/vla-av.git
 cd vla-av
+git lfs install
 git lfs pull
 ```
 
-## 2. Install System Dependencies
+For a private repository, GitHub authentication is required only for cloning.
+Never place a personal access token in `.env` or any project file.
+
+## 2. Install Ubuntu Dependencies
 
 ```bash
 cd ~/Desktop/vla-av
 bash scripts/install_system_deps_ubuntu22.sh
 ```
 
-Then make sure SUMO is visible:
+This installs SUMO, `sumo-gui`, Git LFS, FFmpeg, graphical runtime libraries,
+Node/npm for TwinSentinel, and Python venv support.
+
+Verify SUMO:
 
 ```bash
+sumo --version
+sumo-gui --version
 export SUMO_HOME=/usr/share/sumo
 ```
 
-Add it to `~/.bashrc` if needed.
-
-## 3. Install CARLA 0.9.15
-
-Install CARLA 0.9.15 outside the Git repository, for example:
-
-```text
-~/carla_simulator
-```
-
-The expected executable is:
-
-```text
-~/carla_simulator/CarlaUE4.sh
-```
-
-Then export:
+## 3. Install CARLA 0.9.15 And Bench2Drive Maps
 
 ```bash
-export CARLA_ROOT=$HOME/carla_simulator
+cd ~/Desktop/vla-av
+INSTALL_ADDITIONAL_MAPS=1 bash scripts/install_carla_0915.sh
+export CARLA_ROOT="$HOME/carla_simulator"
 ```
 
-Add it to `~/.bashrc` if needed.
+The script downloads the official CARLA 0.9.15 Linux archive and official
+AdditionalMaps archive, then runs `ImportAssets.sh`. To use an existing CARLA
+installation, skip the installer and set `CARLA_ROOT` to the folder containing
+`CarlaUE4.sh`.
 
-CARLA must not be committed to Git because it is too large.
+Persist the runtime paths if desired:
 
-## 4. Create The Conda Environment
+```bash
+printf '\nexport CARLA_ROOT="$HOME/carla_simulator"\nexport SUMO_HOME=/usr/share/sumo\n' >> ~/.bashrc
+```
+
+The repository already contains Bench2Drive, ScenarioRunner, and all 220 route
+XML files under `external/simlingo/`; no additional Bench2Drive clone is needed.
+
+## 4. Install Miniconda
+
+Skip this section when `conda --version` already works.
+
+```bash
+cd /tmp
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash Miniconda3-latest-Linux-x86_64.sh -b -p "$HOME/miniconda3"
+source "$HOME/miniconda3/etc/profile.d/conda.sh"
+conda init bash
+```
+
+Open a new shell after `conda init`, or keep sourcing `conda.sh` in the current
+shell.
+
+## 5. Create The SimLingo Environment
 
 ```bash
 cd ~/Desktop/vla-av
@@ -97,15 +88,11 @@ conda env create -f environment.simlingo.yml
 conda activate simlingo
 ```
 
-If dependency solving fails on a different machine, use the lock/provenance files
-as references:
+The supported runtime is Python 3.8.18. `environment.simlingo-lock.yml` and
+`requirements.freeze.txt` preserve the local environment provenance when an
+exact dependency comparison is needed.
 
-```text
-environment.simlingo-lock.yml
-requirements.freeze.txt
-```
-
-## 5. Download SimLingo Weights
+## 6. Download The Public SimLingo Weights
 
 ```bash
 cd ~/Desktop/vla-av
@@ -113,23 +100,41 @@ conda activate simlingo
 bash scripts/download_simlingo_model.sh
 ```
 
-Expected file:
+Expected artifact:
 
 ```text
 models/simlingo_hf/simlingo/checkpoints/epoch=013.ckpt/pytorch_model.pt
 ```
 
-## 6. Validate The Installation
+The script uses the public Hugging Face repository `RenzKa/simlingo`. If the
+Hub asks for authentication, run `hf auth login` with the new user's own token.
+The token must never be committed or sent by another developer.
+
+The hidden legacy CarDreamer mirror is optional. To reproduce that backend too,
+download its public upstream checkpoint with:
+
+```bash
+bash scripts/download_cardreamer_overtake_checkpoint.sh
+```
+
+The downloader rejects the file unless its SHA-256 matches the runtime contract.
+
+## 7. Validate Everything
 
 ```bash
 cd ~/Desktop/vla-av
+conda activate simlingo
+export CARLA_ROOT="$HOME/carla_simulator"
+export SUMO_HOME=/usr/share/sumo
 bash scripts/check_fresh_install.sh
+bash scripts/audit_repository_for_publish.sh
 ```
 
-The script checks Python, CARLA path, SUMO, key model files, Dreamer checkpoints,
-and important imports without launching a full simulation.
+The checker verifies CARLA, SUMO, route XML files, Python imports, dashboard
+syntax, TwinSentinel source, and that promoted Git LFS checkpoints are real
+binary files rather than unresolved pointer files.
 
-## 7. Run The Dashboard
+## 8. Launch The Full Local Application
 
 ```bash
 cd ~/Desktop/vla-av
@@ -138,18 +143,34 @@ bash scripts/stop_simlingo_dashboard.sh
 bash scripts/run_simlingo_dashboard.sh
 ```
 
-Open:
+Open `http://127.0.0.1:8765`.
 
-```text
-http://127.0.0.1:8765
+This interactive dashboard can launch CARLA/SimLingo, SUMO mirror mode,
+recording/replay, promoted Dreamer modes, KPI refresh, and the TwinSentinel
+attack console.
+
+## 9. Launch Only The Shareable Frontend
+
+```bash
+cd ~/Desktop/vla-av
+python3 scripts/export_streamlit_dashboard.py
+bash scripts/run_streamlit_dashboard_readonly.sh
 ```
 
-## Notes
+Open `http://127.0.0.1:8501`. This app serves a committed, sanitized static
+snapshot. It contains the current KPI values but has no process-control backend
+and cannot launch or modify anything, even if a visitor clicks a control.
 
-If the dashboard opens but a simulation does not start, check first:
+For Streamlit Community Cloud, select `streamlit_share/app.py` as the app file.
 
-- `CARLA_ROOT` points to the right CARLA 0.9.15 folder.
-- `SUMO_HOME=/usr/share/sumo`.
-- The SimLingo model was downloaded.
-- The NVIDIA driver is installed and `nvidia-smi` works.
-- Port `2000` is free or old CARLA processes were stopped.
+## Common Failures
+
+- **Checkpoint is a short text file:** run `git lfs pull`.
+- **Town not installed:** rerun
+  `CARLA_ROOT="$HOME/carla_simulator" bash scripts/install_carla_additional_maps_0915.sh`.
+- **`sumolib` or `traci` missing:** export `SUMO_HOME=/usr/share/sumo`.
+- **Dashboard opens but CARLA times out:** stop old processes, verify port 2000,
+  and run `nvidia-smi`.
+- **SimLingo model missing:** rerun `bash scripts/download_simlingo_model.sh`.
+- **Hydra cannot import `simlingo_training.models`:** launch from the repository
+  scripts; they set the required `PYTHONPATH` for the vendored SimLingo tree.

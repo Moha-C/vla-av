@@ -1,0 +1,3 @@
+# Optional DeepAccident preparation dependency. PyTorch, torchvision, Pillow,
+# NumPy, and scikit-learn are already pinned by the main project environment.
+gdown==5.2.0

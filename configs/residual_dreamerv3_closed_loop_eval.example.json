@@ -1,0 +1,17 @@
+{
+  "schema_version": "residual_dreamerv3_closed_loop_eval_v1",
+  "paired_evaluation": true,
+  "seeds": [101, 102, 103, 104, 105, 106],
+  "baseline": {
+    "driving_score": 0.0,
+    "route_completion": 0.0,
+    "collisions_per_km": 0.0,
+    "offroad_rate": 0.0
+  },
+  "candidate": {
+    "driving_score": 0.0,
+    "route_completion": 0.0,
+    "collisions_per_km": 0.0,
+    "offroad_rate": 0.0
+  }
+}
