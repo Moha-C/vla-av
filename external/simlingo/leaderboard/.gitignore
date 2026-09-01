@@ -5,3 +5,8 @@
 .pydevproject
 *.sh
 *.xml
+
+# The dashboard and fresh-install pipeline require the canonical Bench2Drive
+# route catalog. Keep generated XML ignored while versioning these 220 inputs.
+!data/bench2drive_split/
+!data/bench2drive_split/bench2drive_*.xml
